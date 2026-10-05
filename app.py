@@ -15,6 +15,95 @@ import streamlit as st
 import vms_pipeline as vp
 
 st.set_page_config(page_title="VMS Attendance Reports", page_icon="📊", layout="wide")
+
+GALAXY_CSS = """
+<style>
+/* ── Galaxy background ─────────────────────────────────────────── */
+.stApp {
+    isolation: isolate;
+    background:
+        radial-gradient(ellipse 60% 45% at 15% 10%, rgba(124, 58, 237, 0.45), transparent 70%),
+        radial-gradient(ellipse 55% 50% at 85% 20%, rgba(37, 99, 235, 0.38), transparent 70%),
+        radial-gradient(ellipse 60% 45% at 60% 95%, rgba(219, 39, 119, 0.28), transparent 70%),
+        radial-gradient(ellipse 40% 30% at 5% 80%, rgba(14, 165, 233, 0.22), transparent 70%),
+        linear-gradient(180deg, #04030d 0%, #0a0d2b 55%, #04030d 100%);
+    background-attachment: fixed;
+}
+/* two star layers (different tile sizes) that twinkle out of phase */
+.stApp::before, .stApp::after {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+}
+.stApp::before {
+    background-image:
+        radial-gradient(1px 1px at 20px 30px, #fff, transparent),
+        radial-gradient(1px 1px at 90px 120px, #e0e7ff, transparent),
+        radial-gradient(1.5px 1.5px at 160px 60px, #fff, transparent),
+        radial-gradient(1px 1px at 230px 180px, #fde68a, transparent),
+        radial-gradient(2px 2px at 300px 90px, #fff, transparent),
+        radial-gradient(1px 1px at 60px 210px, #bae6fd, transparent),
+        radial-gradient(1.5px 1.5px at 330px 220px, #fff, transparent);
+    background-size: 360px 260px;
+    animation: twinkleA 5s ease-in-out infinite alternate;
+}
+.stApp::after {
+    background-image:
+        radial-gradient(1px 1px at 40px 70px, #fff, transparent),
+        radial-gradient(2px 2px at 140px 20px, #c4b5fd, transparent),
+        radial-gradient(1px 1px at 250px 150px, #fff, transparent),
+        radial-gradient(1.5px 1.5px at 420px 240px, #fbcfe8, transparent),
+        radial-gradient(1px 1px at 470px 60px, #fff, transparent),
+        radial-gradient(1px 1px at 90px 300px, #fff, transparent);
+    background-size: 520px 340px;
+    background-position: 130px 90px;
+    animation: twinkleB 7s ease-in-out infinite alternate, drift 160s linear infinite;
+}
+@keyframes twinkleA { from { opacity: 0.35; } to { opacity: 1; } }
+@keyframes twinkleB { from { opacity: 1; } to { opacity: 0.3; } }
+@keyframes drift    { from { background-position: 130px 90px; } to { background-position: 130px 1130px; } }
+@media (prefers-reduced-motion: reduce) {
+    .stApp::before, .stApp::after { animation: none; }
+}
+
+/* ── Readable "glass" panels over the galaxy ───────────────────── */
+[data-testid="stHeader"] { background: transparent; }
+[data-testid="stMainBlockContainer"] {
+    background: rgba(8, 10, 32, 0.55);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    border: 1px solid rgba(165, 180, 252, 0.18);
+    border-radius: 18px;
+    padding: 2rem 2.2rem 2.5rem 2.2rem;
+    margin-top: 1rem;
+    box-shadow: 0 0 40px rgba(99, 102, 241, 0.12);
+}
+[data-testid="stSidebar"] {
+    background: rgba(6, 8, 26, 0.78);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    border-right: 1px solid rgba(165, 180, 252, 0.15);
+}
+[data-testid="stFileUploaderDropzone"] {
+    background: rgba(99, 102, 241, 0.08);
+    border: 1px dashed rgba(165, 180, 252, 0.45);
+}
+h1 {
+    background: linear-gradient(90deg, #c4b5fd, #93c5fd, #f9a8d4);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+}
+.stButton > button[kind="primary"], .stDownloadButton > button[kind="primary"] {
+    background: linear-gradient(90deg, #6d28d9, #2563eb);
+    border: none;
+    box-shadow: 0 0 16px rgba(99, 102, 241, 0.45);
+}
+</style>
+"""
+st.markdown(GALAXY_CSS, unsafe_allow_html=True)
 st.title("📊 Linways Attendance → VMS Reports")
 st.caption("Upload the raw Linways export, choose your options, and download the generated reports.")
 
