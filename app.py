@@ -71,6 +71,7 @@ def generate(raw_bytes, batch_bytes, opts):
                 raw_path, batch_path, os.path.join(tmp, "VMS_Report_Abstract.xlsx"),
                 opts["date"], opts["program"])
             grab(aout, "VMS_Report_Abstract.xlsx")
+            logs += [("Abstract", "Batch List check", False, w) for w in vp.ABSTRACT_WARNINGS]
 
     return files, summaries, logs
 
@@ -147,6 +148,6 @@ if res:
                 use_container_width=True, hide_index=True)
 
     if res["logs"]:
-        with st.expander("Debar list log"):
+        with st.expander("Logs & warnings", expanded=any(not l[2] for l in res["logs"])):
             for kind, sheet, ok, detail in res["logs"]:
                 st.write(f"{'✅' if ok else '⚠️'} **{kind}** · {sheet}: {detail}")
