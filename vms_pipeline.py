@@ -209,6 +209,55 @@ def canon_section(s):
     return re.sub(r"[\s\-]+", " ", str(s).strip()).strip().upper()
 
 
+def canon_subject(s):
+    """Normalize a subject name purely for MATCHING (case/whitespace)."""
+    return re.sub(r"\s+", " ", str(s).strip()).upper()
+
+
+# Manual fixes for Linways data errors, applied on top of the Batch List.
+# (roll, canonical subject) -> (batch label, faculty). The student is moved
+# into exactly this batch/faculty for that subject, even if the Batch List
+# has them elsewhere (or not at all). Add more lines here as needed.
+MANUAL_BATCH_OVERRIDES = {
+    ("25CG102", canon_subject("OPERATING SYSTEMS AND SHELL PROGRAMMING LAB")): ("Batch 4", "PARVEZ AHMED SHARIFF"),
+    ("25CG102", canon_subject("OPERATING SYSTEMS LAB")): ("Batch 4", "PARVEZ AHMED SHARIFF"),
+}
+
+
+def align_batch_entries(batch_entries, G, C):
+    """Rewrite each Batch List subject to the exact spelling used in the
+    consolidated report (case/whitespace-insensitive match), so a lab never
+    silently drops out because the two files spell it slightly differently."""
+    names = {}
+    for r in G:
+        sub = r.get(C["subject"])
+        if sub:
+            names.setdefault(canon_subject(sub), str(sub).strip())
+    return [(sec, names.get(canon_subject(sub), sub), roll, bl, fac)
+            for sec, sub, roll, bl, fac in batch_entries]
+
+
+def apply_manual_overrides(batch_entries, G, C):
+    """Apply MANUAL_BATCH_OVERRIDES: drop the student's Batch List row for
+    that subject and insert the forced batch/faculty, taking the section
+    from the consolidated report."""
+    if not MANUAL_BATCH_OVERRIDES:
+        return batch_entries
+    out = [e for e in batch_entries
+           if (str(e[2]).strip().upper(), canon_subject(e[1])) not in MANUAL_BATCH_OVERRIDES]
+    done = set()
+    for r in G:
+        roll = str(r.get(C["roll"]) or "").strip()
+        subj = str(r.get(C["subject"]) or "").strip()
+        key = (roll.upper(), canon_subject(subj))
+        if key in MANUAL_BATCH_OVERRIDES and key not in done:
+            batch_label, fac = MANUAL_BATCH_OVERRIDES[key]
+            section = str(r.get(C["batch"]) or "").strip().replace("/", "-")
+            out.append((section, subj, roll, batch_label, fac))
+            done.add(key)
+    return out
+
+
 def series_of(batch):
     """'BCA 2025 A' -> 'BCA 2025'; 'BCA AIML 2026 - A' -> 'BCA AIML 2026'
     — the series (full program/specialization stream + year) a section
@@ -303,18 +352,6 @@ def load_batch_list(path):
             if not (roll and section and course_raw and fac):
                 continue
             subject, batch_label = parse_course_community_name(course_raw)
-            # Roll 25CG102 (PRUTHVI RAJ H)'s Batch List row for Operating
-            # Systems Lab, BCA 2025 Section B, has a bad/merged faculty
-            # entry ("Nasrulla Khan K,PARVEZ AHMED SHARIFF") — force
-            # Parvez for THIS roll + THIS section + THIS subject only.
-            # The student's other two labs are left untouched, using
-            # whatever faculty the sheet says.
-            if (
-                roll.upper() == "25CG102"
-                and section.upper() == "BCA 2025 B"
-                and subject.strip().upper() == "OPERATING SYSTEMS LAB"
-            ):
-                fac = "PARVEZ AHMED SHARIFF"
             entries.append((section, subject, roll, batch_label, fac))
     return entries
 
@@ -837,6 +874,8 @@ def build_report(input_path, output_path, low=0.0, high=75.0, dept="ALL", exclud
     extra_ignore = None if include_soft_skill else [SOFT_SKILL_KEYWORD]
     G, C = load_raw(input_path, extra_ignore)
     batch_entries = load_batch_list(batch_list_path) if batch_list_path else None
+    if batch_entries:
+        batch_entries = apply_manual_overrides(align_batch_entries(batch_entries, G, C), G, C)
     subject_groups, student_group = build_faculty_maps(G, C, batch_entries)
     df = apply_subject_filters(G, C, exclude=exclude, include=include)
     if not df:
@@ -1119,33 +1158,55 @@ def _abstract_apply(cell, style):
         cell.fill = style["fill"]
 
 
-def _abstract_section_rows(section, subject_rows, C, batch_map):
-    """For one section, one row per subject (or one per GROUP — a
-    (batch_label, faculty) pair — if a subject has more than one distinct
-    group), each as {"subject":..., "faculty":..., "buckets":[6 ints],
-    "total": int}. When a subject splits across more than one group, the
-    faculty display is prefixed with its lab batch label ('Batch 1 -
-    NAME'), same as the debar legend. This also correctly separates two
-    lab batches taught by the SAME faculty — they're still two different
-    groups and get two different rows, rather than being merged into one
-    combined count. A single-group subject just shows the plain name, no
-    label needed."""
+FRENCH_RE = re.compile(r"FRENCH", re.I)
+FRENCH_FACULTY = "SAMARTH SONI"  # French is always shown under this faculty in the abstract
+ABSTRACT_WARNINGS = []  # filled by build_abstract(); data problems worth a look
+
+
+def _french_one_row_per_student(srows, C):
+    """One record per student for French. If Linways holds two records (the
+    old and new faculty), keep the Samarth Soni one; otherwise keep what's there."""
+    fac_key = C.get("faculty")
+    chosen = {}
+    for r in srows:
+        roll = str(r.get(C["roll"]) or "").strip()
+        is_samarth = bool(fac_key) and "SAMARTH" in str(r.get(fac_key) or "").upper()
+        cur = chosen.get(roll)
+        if cur is None or (is_samarth and not cur[0]):
+            chosen[roll] = (is_samarth, r)
+    return [v[1] for v in chosen.values()]
+
+
+def _abstract_section_rows(section, subject_rows, C, batch_map, batch_groups=None):
+    """For one section, one row per subject — or one per GROUP, a
+    (batch_label, faculty) pair, when a subject has several. Every group the
+    Batch List defines for the subject is shown, EVEN IF it has zero
+    shortage students (a batch with no shortage used to vanish whenever
+    another batch of the same lab had shortage). French always appears as a
+    single row under FRENCH_FACULTY."""
     subjects = get_subjects(subject_rows, C)
     out_rows = []
-    key_section = canon_section(section)  # batch_map is keyed by canon_section() — see its docstring
+    key_section = canon_section(section)  # batch_map/batch_groups are keyed by canon_section()
     for subj in subjects:
+        subj_key = str(subj).strip()
+        is_french = bool(FRENCH_RE.search(subj_key))
         srows = [r for r in subject_rows if r[C["subject"]] == subj]
-        by_group = {}  # (batch_label, faculty) -> [6 bucket counts]
-        all_groups = set()  # every distinct group for this subject/section, even with zero shortage count
+        if is_french:
+            srows = _french_one_row_per_student(srows, C)
+
+        by_group = {}      # (batch_label, faculty) -> [6 bucket counts]
+        all_groups = set()
         for r in srows:
             roll = str(r.get(C["roll"]) or "").strip()
-            pct = r.get(C["attendance"])
-            bidx = bucket_index(pct)
-            entry = batch_map.get((key_section, subj, roll))
-            if entry:
-                batch_label, fac = entry
+            bidx = bucket_index(r.get(C["attendance"]))
+            if is_french:
+                batch_label, fac = None, FRENCH_FACULTY
             else:
-                batch_label, fac = None, str(r.get(C["faculty"]) or "").strip()
+                entry = batch_map.get((key_section, subj_key, roll))
+                if entry:
+                    batch_label, fac = entry
+                else:
+                    batch_label, fac = None, str(r.get(C["faculty"]) or "").strip()
             fac = fac or "—"
             group_key = (batch_label, fac)
             all_groups.add(group_key)
@@ -1153,20 +1214,17 @@ def _abstract_section_rows(section, subject_rows, C, batch_map):
                 continue
             by_group.setdefault(group_key, [0] * 6)[bidx] += 1
 
-        if not by_group:
-            # Nobody fell into a shortage bucket (e.g. all-zero count for
-            # this subject) — still show the group(s) rather than leaving
-            # the column blank. Show the batch label whenever it's known,
-            # even if this subject only has ONE group in this section —
-            # a single batch is still a batch and shouldn't be hidden.
-            if all_groups:
-                for batch_label, fac in sorted(all_groups, key=group_sort_key):
-                    display = group_label(batch_label, fac) if batch_label else fac
-                    out_rows.append({"subject": subj, "faculty": display, "buckets": [0] * 6, "total": 0})
-            else:
-                out_rows.append({"subject": subj, "faculty": "", "buckets": [0] * 6, "total": 0})
-            continue
+        if is_french:
+            zero_groups = {(None, FRENCH_FACULTY)}
+        else:
+            bg = (batch_groups or {}).get((key_section, subj_key))
+            zero_groups = set(bg) if bg else set(all_groups)
+        for g in zero_groups:
+            by_group.setdefault(g, [0] * 6)
 
+        if not by_group:
+            out_rows.append({"subject": subj, "faculty": "", "buckets": [0] * 6, "total": 0})
+            continue
         for batch_label, fac in sorted(by_group, key=group_sort_key):
             buckets = by_group[(batch_label, fac)]
             display = group_label(batch_label, fac) if batch_label else fac
@@ -1174,7 +1232,7 @@ def _abstract_section_rows(section, subject_rows, C, batch_map):
     return out_rows
 
 
-def write_abstract_sheet(ws, sections, G, C, batch_map, date_str=None, program="BCA", sem_heading=""):
+def write_abstract_sheet(ws, sections, G, C, batch_map, date_str=None, program="BCA", sem_heading="", batch_groups=None):
     ws.sheet_view.showGridLines = False
     ws.column_dimensions["A"].width = ABSTRACT_COL_SECTION_W
     ws.column_dimensions["B"].width = ABSTRACT_COL_SUBJECT_W
@@ -1210,7 +1268,7 @@ def write_abstract_sheet(ws, sections, G, C, batch_map, date_str=None, program="
     r = 3
     for section in sections:
         sec_rows = [row for row in G if str(row.get(C["batch"]) or "").strip().replace("/", "-") == section]
-        rows_for_section = _abstract_section_rows(section, sec_rows, C, batch_map)
+        rows_for_section = _abstract_section_rows(section, sec_rows, C, batch_map, batch_groups)
         if not rows_for_section:
             continue
 
@@ -1290,12 +1348,37 @@ def build_abstract(input_path, batch_list_path, output_path, date_str=None, prog
     # ('BCA AIML 2026 A') still matches the report's own spelling
     # ('BCA AIML 2026 - A') — see canon_section()'s docstring. batch_map
     # is looked up the same way inside _abstract_section_rows().
+    batch_entries = apply_manual_overrides(align_batch_entries(batch_entries, G, C), G, C)
+
     batch_map = {}
+    batch_groups = {}  # (canon section, subject) -> {(batch_label, faculty)} — every batch the list defines
     covered_sections = set()
     for section, subject, roll, batch_label, fac in batch_entries:
         key_section = canon_section(section)
+        subject = str(subject).strip()
         batch_map[(key_section, subject, roll)] = (batch_label, fac)
+        batch_groups.setdefault((key_section, subject), set()).add((batch_label, fac))
         covered_sections.add(key_section)
+
+    # Data-quality checks so nothing goes missing silently.
+    ABSTRACT_WARNINGS.clear()
+    report_keys, unmatched = set(), {}
+    for r in G:
+        sec = canon_section(str(r.get(C["batch"]) or "").strip().replace("/", "-"))
+        subj = str(r.get(C["subject"]) or "").strip()
+        report_keys.add((sec, subj))
+        if (sec, subj) in batch_groups:
+            roll = str(r.get(C["roll"]) or "").strip()
+            if (sec, subj, roll) not in batch_map:
+                unmatched.setdefault((sec, subj), set()).add(roll)
+    for (sec, subj), groups in sorted(batch_groups.items()):
+        if (sec, subj) not in report_keys and any(k[0] == sec for k in report_keys):
+            labels = ", ".join(sorted({bl or fac for bl, fac in groups}))
+            ABSTRACT_WARNINGS.append(f"{sec} / {subj} ({labels}): in the Batch List but not in the consolidated report - not shown.")
+    for (sec, subj), rolls in sorted(unmatched.items()):
+        ABSTRACT_WARNINGS.append(f"{sec} / {subj}: {len(rolls)} student(s) in the report are missing from the Batch List: {', '.join(sorted(rolls))}")
+    for w in ABSTRACT_WARNINGS:
+        print(f"  [check] {w}")
 
     section_sem = {}
     for r in G:
@@ -1320,7 +1403,7 @@ def build_abstract(input_path, batch_list_path, output_path, date_str=None, prog
         sheet_name = f"SUB {sem_label(sem)} SEM"[:31]
         ws = wb.create_sheet(sheet_name)
         write_abstract_sheet(ws, sections, G, C, batch_map, date_str=date_str, program=program,
-                              sem_heading=sem_label(sem))
+                              sem_heading=sem_label(sem), batch_groups=batch_groups)
 
     if not wb.sheetnames:
         raise ValueError("No abstract sheets generated.")
