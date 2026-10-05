@@ -110,8 +110,17 @@ st.caption("Upload the raw Linways export, choose your options, and download the
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
-def split_csv(text):
-    return [s.strip() for s in text.split(",") if s.strip()]
+@st.cache_data(show_spinner=False)
+def read_options(raw_bytes):
+    """Departments and subject names present in the uploaded raw export."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "raw.xlsx")
+        with open(path, "wb") as f:
+            f.write(raw_bytes)
+        G, C = vp.load_raw(path)
+    depts = sorted({r["_dept"] for r in G if r["_dept"]})
+    subjects = sorted({r[C["subject"]] for r in G}, key=lambda x: str(x).upper())
+    return depts, subjects
 
 
 def generate(raw_bytes, batch_bytes, opts):
@@ -143,14 +152,15 @@ def generate(raw_bytes, batch_bytes, opts):
 
         # 2) Debar list + notice-board copy
         if opts["debar"]:
-            dout, dlog = vp.build_debar_list(out, os.path.join(tmp, "VMS_Report_Debar.xlsx"), opts["date"])
+            dout, dlog = vp.build_debar_list(out, os.path.join(tmp, "VMS_Report_Debar.xlsx"), opts["date"],
+                                          list_no=opts["list_no"])
             grab(dout, "VMS_Report_Debar.xlsx")
             logs += [("Debar", *row) for row in dlog]
 
             if opts["notice"]:
                 nout, nlog = vp.build_debar_list(
                     out, os.path.join(tmp, "VMS_Report_Debar_NoticeBoard.xlsx"),
-                    opts["date"], notice_board=True)
+                    opts["date"], notice_board=True, list_no=opts["list_no"])
                 grab(nout, "VMS_Report_Debar_NoticeBoard.xlsx")
                 logs += [("Notice board", *row) for row in nlog]
 
@@ -165,25 +175,6 @@ def generate(raw_bytes, batch_bytes, opts):
     return files, summaries, logs
 
 
-# ───────────────────────── Sidebar options ─────────────────────────
-with st.sidebar:
-    st.header("Options")
-    low = st.number_input("Attendance % lower limit", 0.0, 100.0, 0.0, 1.0)
-    high = st.number_input("Attendance % upper limit", 0.0, 100.0, 75.0, 1.0)
-    dept = st.text_input("Department", "ALL", help="e.g. BCA, MCA, or ALL")
-    include_text = st.text_input("Include only these subjects", "", help="Comma-separated, exact names. Blank = all.")
-    exclude_text = st.text_input("Exclude these subjects", "", help="Comma-separated, exact names.")
-    soft_skill = st.checkbox("Include Soft Skill in the main report", value=False,
-                             help="The Abstract workbook never includes Soft Skill.")
-    st.divider()
-    as_of = st.date_input("'As of' date", date.today(), format="DD/MM/YYYY")
-    program = st.text_input("Program name (abstract heading)", "BCA")
-    st.divider()
-    make_debar = st.checkbox("Build Tentative Debar List", value=True)
-    make_notice = st.checkbox("Also build Notice Board copy", value=True, disabled=not make_debar)
-    make_abstract = st.checkbox("Build Abstract workbook", value=True,
-                                help="Requires the Lab Batch List file.")
-
 # ───────────────────────── Uploads ─────────────────────────
 c1, c2 = st.columns(2)
 with c1:
@@ -191,14 +182,50 @@ with c1:
 with c2:
     batch_file = st.file_uploader("Lab Batch List (.xlsx) — optional", type=["xlsx"])
 
+dept_options, subject_options = [], []
+if raw_file is not None:
+    try:
+        dept_options, subject_options = read_options(raw_file.getvalue())
+    except Exception as e:
+        st.error(f"Could not read the raw export: {e}")
+
+# ───────────────────────── Sidebar options ─────────────────────────
+with st.sidebar:
+    st.header("Options")
+    low = st.number_input("Attendance % lower limit", 0.0, 100.0, 0.0, 1.0)
+    high = st.number_input("Attendance % upper limit", 0.0, 100.0, 75.0, 1.0)
+    dept = st.selectbox("Department", ["ALL"] + dept_options,
+                        help="Departments found in the uploaded file. Upload the raw export to see them.")
+    include_subjects = st.multiselect("Include only these subjects", subject_options,
+                                      placeholder="All subjects (tick to limit)",
+                                      help="Leave empty to keep every subject.",
+                                      disabled=not subject_options)
+    exclude_subjects = st.multiselect("Exclude these subjects", subject_options,
+                                      placeholder="None (tick to drop)",
+                                      disabled=not subject_options)
+    soft_skill = st.checkbox("Include Soft Skill in the main report", value=False,
+                             help="The Abstract workbook never includes Soft Skill.")
+    st.divider()
+    as_of = st.date_input("'As of' date", date.today(), format="DD/MM/YYYY")
+    program = st.text_input("Program name (abstract heading)", "BCA")
+    list_no = st.text_input("Tentative Debar List no.", "1",
+                            help="Type 1, 2, 3, 4 ... — shown in the title as I, II, III, IV.")
+    st.caption(f"Title: TENTATIVE DEBAR LIST {vp.debar_list_label(list_no)}")
+    st.divider()
+    make_debar = st.checkbox("Build Tentative Debar List", value=True)
+    make_notice = st.checkbox("Also build Notice Board copy", value=True, disabled=not make_debar)
+    make_abstract = st.checkbox("Build Abstract workbook", value=True,
+                                help="Requires the Lab Batch List file.")
+
 if make_abstract and not batch_file:
     st.info("Upload the Lab Batch List to also get the Abstract workbook. "
             "Without it, lab faculty and batches come from the report's own faculty column.")
 
 if st.button("Generate reports", type="primary", disabled=raw_file is None):
     opts = dict(
-        low=low, high=high, dept=dept.strip() or "ALL",
-        include=split_csv(include_text), exclude=split_csv(exclude_text),
+        low=low, high=high, dept=dept or "ALL",
+        include=list(include_subjects), exclude=list(exclude_subjects),
+        list_no=list_no,
         soft_skill=soft_skill, date=as_of.strftime("%d.%m.%Y"),
         program=program.strip() or "BCA",
         debar=make_debar, notice=make_notice, abstract=make_abstract,
