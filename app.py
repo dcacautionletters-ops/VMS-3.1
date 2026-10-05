@@ -123,7 +123,7 @@ def read_options(raw_bytes):
     return depts, subjects
 
 
-def generate(raw_bytes, batch_bytes, opts):
+def generate(raw_bytes, batch_bytes, master_bytes, opts):
     """Build every requested report inside a temp dir and return
     (files: {name: bytes}, summaries, logs)."""
     files, logs, summaries = {}, [], []
@@ -137,6 +137,13 @@ def generate(raw_bytes, batch_bytes, opts):
             batch_path = os.path.join(tmp, "batch_list.xlsx")
             with open(batch_path, "wb") as f:
                 f.write(batch_bytes)
+
+        master = None
+        if master_bytes:
+            master_path = os.path.join(tmp, "master.xlsx")
+            with open(master_path, "wb") as f:
+                f.write(master_bytes)
+            master = vp.load_master_data(master_path)
 
         def grab(path, name):
             with open(path, "rb") as f:
@@ -153,7 +160,7 @@ def generate(raw_bytes, batch_bytes, opts):
         # 2) Debar list + notice-board copy
         if opts["debar"]:
             dout, dlog = vp.build_debar_list(out, os.path.join(tmp, "VMS_Report_Debar.xlsx"), opts["date"],
-                                          list_no=opts["list_no"])
+                                          list_no=opts["list_no"], master=master)
             grab(dout, "VMS_Report_Debar.xlsx")
             logs += [("Debar", *row) for row in dlog]
 
@@ -176,11 +183,24 @@ def generate(raw_bytes, batch_bytes, opts):
 
 
 # ───────────────────────── Uploads ─────────────────────────
-c1, c2 = st.columns(2)
-with c1:
+use_master = st.radio(
+    "Add student & parent phone numbers from a master data set?",
+    ["No", "Yes"], horizontal=True, index=0,
+    help="Yes = upload the master data set and the Tentative Debar List gets Student Phone No. and "
+         "Parent Phone No. columns after the student name. No = the standard debar list, as before.",
+) == "Yes"
+
+cols = st.columns(3 if use_master else 2)
+with cols[0]:
     raw_file = st.file_uploader("Raw Linways export (.xlsx)", type=["xlsx"])
-with c2:
+with cols[1]:
     batch_file = st.file_uploader("Lab Batch List (.xlsx) — optional", type=["xlsx"])
+master_file = None
+if use_master:
+    with cols[2]:
+        master_file = st.file_uploader(
+            "Master data set (.xlsx)", type=["xlsx"],
+            help="Columns used: B = Reg No, F = Name, J = Batch, AU = Student phone, AV = Parent phone.")
 
 dept_options, subject_options = [], []
 if raw_file is not None:
@@ -217,6 +237,12 @@ with st.sidebar:
     make_abstract = st.checkbox("Build Abstract workbook", value=True,
                                 help="Requires the Lab Batch List file.")
 
+if use_master and not master_file:
+    st.warning("Upload the master data set to add phone numbers — until then the standard debar list "
+               "(without phone numbers) will be generated.")
+elif master_file and make_debar:
+    st.caption("📞 Phone numbers are added to the Tentative Debar List only — not the Notice Board copy, "
+               "which is displayed publicly.")
 if make_abstract and not batch_file:
     st.info("Upload the Lab Batch List to also get the Abstract workbook. "
             "Without it, lab faculty and batches come from the report's own faculty column.")
@@ -233,7 +259,8 @@ if st.button("Generate reports", type="primary", disabled=raw_file is None):
     try:
         with st.spinner("Building reports..."):
             files, summaries, logs = generate(
-                raw_file.getvalue(), batch_file.getvalue() if batch_file else None, opts)
+                raw_file.getvalue(), batch_file.getvalue() if batch_file else None,
+                master_file.getvalue() if master_file else None, opts)
         st.session_state["result"] = dict(files=files, summaries=summaries, logs=logs)
     except Exception as e:
         st.session_state.pop("result", None)
