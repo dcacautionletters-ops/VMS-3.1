@@ -259,25 +259,24 @@ def apply_manual_overrides(batch_entries, G, C):
 
 
 def series_of(batch):
-    """'BCA 2025 A' -> 'BCA 2025'; 'BCA AIML 2026 - A' -> 'BCA AIML 2026'
-    — the series (full program/specialization stream + year) a section
-    belongs to, independent of the trailing section letter. Takes every
-    token up to and including the 4-digit year, so a specialization
-    stream like AIML or DS gets its OWN series instead of being folded
-    into the plain BCA series for the same year — 'BCA AIML 2026 - A'
-    and 'BCA 2026 A' must never be treated as the same GEN/GEN ALL
-    group just because they share a year."""
+    """'BCA 2025 A' -> 'BCA 2025'; 'BCA AIML 2025 - A' -> 'BCA 2025';
+    'BCA DS 2026 - A' -> 'BCA 2026'.
+
+    The series is the PROGRAM (first word) plus the admission YEAR. The
+    specialization stream (AIML, DS, ...) and the section letter are
+    ignored on purpose: every BCA 2025 section — plain, AIML or DS — is the
+    same batch of students in the same semester, so they all share one
+    GEN / GEN ALL sheet. Same for the BCA 2026 series."""
     parts = str(batch).strip().split()
     if not parts:
         return ""
-    year_idx = next((i for i, p in enumerate(parts) if re.fullmatch(r"\d{4}", p)), None)
-    if year_idx is None:
+    year = next((p for p in parts if re.fullmatch(r"\d{4}", p)), None)
+    if year is None:
         # no clean 4-digit year token — fall back to first token + first
         # numeric token (or 'X') so odd/legacy batch strings still
         # produce *something* usable instead of misgrouping silently.
-        yr = next((p for p in parts if p.isdigit()), "X")
-        return f"{parts[0]} {yr}"
-    return " ".join(parts[: year_idx + 1])
+        year = next((p for p in parts if p.isdigit()), "X")
+    return f"{parts[0]} {year}"
 
 
 def get_series(dept_rows, C):
@@ -287,10 +286,7 @@ def get_series(dept_rows, C):
 
 def series_df(dept_rows, ser, C):
     """Every row whose section belongs EXACTLY to series `ser` — matched
-    via series_of(), not a loose substring test (the old
-    'k0 in batch and k1 in batch' check would match "2026" appearing
-    anywhere in the string, which is how 'BCA AIML 2026 - A' used to leak
-    into the plain 'BCA 2026' series)."""
+    via series_of(), not a loose substring test."""
     return [r for r in dept_rows if series_of(r[C["batch"]]) == ser]
 
 
@@ -354,6 +350,26 @@ def load_batch_list(path):
             subject, batch_label = parse_course_community_name(course_raw)
             entries.append((section, subject, roll, batch_label, fac))
     return entries
+
+
+def to_roman(n):
+    vals = [(1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"),
+            (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")]
+    out = ""
+    for v, sym in vals:
+        while n >= v:
+            out += sym
+            n -= v
+    return out
+
+
+def debar_list_label(x):
+    """Debar list number as shown in the title: 1 -> I, 2 -> II, 3 -> III ...
+    Anything non-numeric (e.g. 'II') is used as typed, uppercased."""
+    t = str(x if x is not None else "").strip()
+    if t.isdigit() and int(t) > 0:
+        return to_roman(int(t))
+    return t.upper() or "I"
 
 
 ROMAN_SEM = {1: "I", 2: "II", 3: "III", 4: "IV", 5: "V", 6: "VI", 7: "VII", 8: "VIII"}
@@ -1384,7 +1400,10 @@ def build_abstract(input_path, batch_list_path, output_path, date_str=None, prog
     for r in G:
         sec = str(r.get(C["batch"]) or "").strip().replace("/", "-")
         if canon_section(sec) in covered_sections and sec not in section_sem:
-            section_sem[sec] = str(r.get(C["sem"]) or "").strip()
+            raw_sem = str(r.get(C["sem"]) or "").strip()
+            # 'S3' / 'Semester 3' / '3' all become '3', so every section of
+            # the same semester (BCA, BCA AIML, BCA DS ...) lands on ONE sheet
+            section_sem[sec] = re.sub(r"\D", "", raw_sem) or raw_sem
 
     missing = covered_sections - {canon_section(s) for s in section_sem}
     if missing:
@@ -1413,7 +1432,7 @@ def build_abstract(input_path, batch_list_path, output_path, date_str=None, prog
 
 
 def build_debar_list(input_path, output_path, date_str=None, notice_board=False,
-                      font_scale=1.6, row_scale=1.6):
+                      font_scale=1.6, row_scale=1.6, list_no="I"):
     """
     For every sheet (batch) in a raw VMS export, build a matching
     "TENTATIVE DEBAR LIST I" sheet: college header image, merged title row,
@@ -1563,7 +1582,7 @@ def build_debar_list(input_path, output_path, date_str=None, notice_board=False,
             ows.row_dimensions[2].height = row2_h
             ows.merge_cells(f"A2:{last_col_letter}2")
             title_cell = ows.cell(row=2, column=1)
-            title_cell.value = f'TENTATIVE DEBAR LIST I - "{sws.title}" as of {date_str}' + \
+            title_cell.value = f'TENTATIVE DEBAR LIST {debar_list_label(list_no)} - "{sws.title}" as of {date_str}' + \
                 (" (NOTICE BOARD COPY)" if notice_board else "")
             _dapply(title_cell, "title", styles)
             for c in range(1, n_cols + 1):
@@ -1924,14 +1943,15 @@ def run_downstream_reports(vms_report_path, raw_path, args):
 
     if not args.skip_debar:
         debar_output = args.debar_output or f"{base}_Debar.xlsx"
-        dout, log = build_debar_list(vms_report_path, debar_output, args.date)
+        dout, log = build_debar_list(vms_report_path, debar_output, args.date, list_no=getattr(args, "list_no", "1"))
         print(f"Debar list saved: {dout}")
         for sheet_name, ok, detail in log:
             print(f"  {'OK' if ok else 'SKIPPED'} {sheet_name}: {detail}")
 
         if not getattr(args, "skip_notice_board", False):
             notice_output = getattr(args, "notice_board_output", None) or f"{base}_Debar_NoticeBoard.xlsx"
-            nout, nlog = build_debar_list(vms_report_path, notice_output, args.date, notice_board=True)
+            nout, nlog = build_debar_list(vms_report_path, notice_output, args.date, notice_board=True,
+                                          list_no=getattr(args, "list_no", "1"))
             print(f"Notice-board debar list saved: {nout}")
             for sheet_name, ok, detail in nlog:
                 print(f"  {'OK' if ok else 'SKIPPED'} {sheet_name}: {detail}")
@@ -1960,6 +1980,7 @@ def main():
     p_format.add_argument("--include", default="", help="Comma-separated subjects to keep (whitelist, applied before --exclude); default: keep all")
     p_format.add_argument("--batch-list", default=None, help="Path to a BCA/MCA Lab Batch List workbook — cross-references lab/internship faculty & batch by Reg No, and unlocks the abstract workbook")
     p_format.add_argument("--date", default=None, help="'as of' date shown in the debar list and abstract workbook, dd.mm.yyyy (default: today)")
+    p_format.add_argument("--list-no", default="1", help="Tentative Debar List number shown in the title: 1, 2, 3 ... (shown as I, II, III)")
     p_format.add_argument("--program", default="BCA", help="Program name shown in the abstract workbook heading, e.g. 'BCA' or 'MCA'")
     p_format.add_argument("--debar-output", default=None, help="Debar list filename (default: derived from output)")
     p_format.add_argument("--abstract-output", default=None, help="Abstract workbook filename (default: derived from output); only built if --batch-list is given")
@@ -1983,11 +2004,13 @@ def main():
     p_debar.add_argument("input", nargs="?", default=None, help="Omit to auto-use the most recently generated VMS Report")
     p_debar.add_argument("output")
     p_debar.add_argument("--date", default=None, help="'as of' date shown in each title, dd.mm.yyyy (default: today)")
+    p_debar.add_argument("--list-no", default="1", help="Tentative Debar List number shown in the title: 1, 2, 3 ... (shown as I, II, III)")
 
     p_notice = sub.add_parser("notice", help="Build the notice-board copy of the Tentative Debar List (no legend/summary, bigger fonts) from a raw VMS export")
     p_notice.add_argument("input", nargs="?", default=None, help="Omit to auto-use the most recently generated VMS Report")
     p_notice.add_argument("output")
     p_notice.add_argument("--date", default=None, help="'as of' date shown in each title, dd.mm.yyyy (default: today)")
+    p_notice.add_argument("--list-no", default="1", help="Tentative Debar List number shown in the title: 1, 2, 3 ... (shown as I, II, III)")
     p_notice.add_argument("--font-scale", type=float, default=1.6, help="Font-size multiplier vs the normal debar list (default 1.6)")
     p_notice.add_argument("--row-scale", type=float, default=1.6, help="Row-height multiplier vs the normal debar list (default 1.6)")
 
@@ -2009,6 +2032,7 @@ def main():
     p_pipeline.add_argument("--include", default="", help="Comma-separated subjects to keep (whitelist, applied before --exclude); default: keep all")
     p_pipeline.add_argument("--batch-list", default=None, help="Path to a BCA/MCA Lab Batch List workbook — cross-references lab/internship faculty & batch by Reg No, and unlocks the abstract workbook")
     p_pipeline.add_argument("--date", default=None, help="'as of' date shown in the debar list and abstract workbook, dd.mm.yyyy (default: today)")
+    p_pipeline.add_argument("--list-no", default="1", help="Tentative Debar List number shown in the title: 1, 2, 3 ... (shown as I, II, III)")
     p_pipeline.add_argument("--program", default="BCA", help="Program name shown in the abstract workbook heading, e.g. 'BCA' or 'MCA'")
     p_pipeline.add_argument("--debar-output", default=None, help="Debar list filename (default: derived from --output)")
     p_pipeline.add_argument("--abstract-output", default=None, help="Abstract workbook filename (default: derived from --output); only built if --batch-list is given")
@@ -2038,14 +2062,14 @@ def main():
         run_downstream_reports(out, args.input, args)
 
     elif args.mode == "debar":
-        out, log = build_debar_list(args.input, args.output, args.date)
+        out, log = build_debar_list(args.input, args.output, args.date, list_no=args.list_no)
         print(f"Saved: {out}")
         for sheet_name, ok, detail in log:
             print(f"  {'OK' if ok else 'SKIPPED'} {sheet_name}: {detail}")
 
     elif args.mode == "notice":
         out, log = build_debar_list(args.input, args.output, args.date, notice_board=True,
-                                     font_scale=args.font_scale, row_scale=args.row_scale)
+                                     font_scale=args.font_scale, row_scale=args.row_scale, list_no=args.list_no)
         print(f"Saved: {out}")
         for sheet_name, ok, detail in log:
             print(f"  {'OK' if ok else 'SKIPPED'} {sheet_name}: {detail}")
