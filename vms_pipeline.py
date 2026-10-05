@@ -1431,8 +1431,90 @@ def build_abstract(input_path, batch_list_path, output_path, date_str=None, prog
     return output_path, sems_present
 
 
+# ══════════════════════════════════════════════════════════════════════
+# MASTER DATA SET — student / parent phone numbers for the debar list
+# ══════════════════════════════════════════════════════════════════════
+# 0-based column positions in the master data workbook:
+#   B = Reg No / Roll No, F = Student Name, J = Batch / Section,
+#   AU = Student Phone No, AV = Parent Phone No
+MASTER_COL_ROLL, MASTER_COL_NAME, MASTER_COL_BATCH = 1, 5, 9
+MASTER_COL_PHONE, MASTER_COL_PARENT = 46, 47
+DEBAR_COL_PHONE_W = 15
+MASTER_WARNINGS = []  # filled by build_debar_list() when a master set is used
+
+
+def canon_roll(x):
+    return re.sub(r"\s+", "", str(x if x is not None else "")).upper()
+
+
+def canon_name(x):
+    return re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9 ]", " ", str(x if x is not None else "").upper())).strip()
+
+
+def names_similar(a, b):
+    """Same name allowing different word order / small spelling slips."""
+    import difflib
+    ta, tb = sorted(canon_name(a).split()), sorted(canon_name(b).split())
+    if ta == tb:
+        return True
+    return difflib.SequenceMatcher(None, " ".join(ta), " ".join(tb)).ratio() >= 0.85
+
+
+def clean_phone(v):
+    """Phone as text: Excel often stores it as a number (9.8765E+9 / 9876543210.0)."""
+    if v is None:
+        return ""
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    t = str(v).strip()
+    if re.fullmatch(r"\d+\.0", t):
+        t = t[:-2]
+    return re.sub(r"\s+", "", t)
+
+
+def load_master_data(path):
+    """Read the master data workbook (fixed columns, see MASTER_COL_*) into
+    lookups by roll no and by name. Header/blank rows are skipped (a real
+    roll no always contains a digit)."""
+    wb = load_workbook(path, data_only=True, read_only=True)
+    by_roll, by_name = {}, {}
+    for ws in wb.worksheets:
+        for row in ws.iter_rows(values_only=True):
+            def cell(i):
+                return row[i] if row is not None and len(row) > i else None
+            roll = str(cell(MASTER_COL_ROLL) or "").strip()
+            if not roll or not re.search(r"\d", roll):
+                continue
+            rec = {
+                "roll": roll,
+                "name": str(cell(MASTER_COL_NAME) or "").strip(),
+                "batch": str(cell(MASTER_COL_BATCH) or "").strip(),
+                "phone": clean_phone(cell(MASTER_COL_PHONE)),
+                "parent": clean_phone(cell(MASTER_COL_PARENT)),
+            }
+            by_roll.setdefault(canon_roll(roll), rec)
+            by_name.setdefault(canon_name(rec["name"]), []).append(rec)
+    wb.close()
+    if not by_roll:
+        raise ValueError("No student rows found in the master data set — expected Reg No in column B, "
+                         "Name in F, Batch in J, Student phone in AU, Parent phone in AV.")
+    return {"by_roll": by_roll, "by_name": by_name}
+
+
+def match_master(master, roll, name):
+    """(record, how) — match by Reg No first; if the roll isn't there, fall
+    back to an exact, UNIQUE name match."""
+    rec = master["by_roll"].get(canon_roll(roll))
+    if rec is not None:
+        return rec, "roll"
+    cands = master["by_name"].get(canon_name(name), [])
+    if len(cands) == 1:
+        return cands[0], "name"
+    return None, None
+
+
 def build_debar_list(input_path, output_path, date_str=None, notice_board=False,
-                      font_scale=1.6, row_scale=1.6, list_no="I"):
+                      font_scale=1.6, row_scale=1.6, list_no="I", master=None):
     """
     For every sheet (batch) in a raw VMS export, build a matching
     "TENTATIVE DEBAR LIST I" sheet: college header image, merged title row,
@@ -1460,6 +1542,14 @@ def build_debar_list(input_path, output_path, date_str=None, notice_board=False,
     """
     if date_str is None:
         date_str = time.strftime("%d.%m.%Y")
+
+    # Phone numbers (student + parent) are added only to the internal copy —
+    # never to the notice-board copy, which is displayed publicly.
+    add_phones = master is not None and not notice_board
+    n_extra = 2 if add_phones else 0
+    master_seen = {}      # canon roll -> (roll, name, how)  for students who got phones
+    master_missing = {}   # canon roll -> name               shortage students not in the master set
+    name_mismatch, section_mismatch, by_name_used = {}, {}, {}
 
     input_path = resolve_input_path(input_path)
     styles = build_debar_style(font_scale) if notice_board else DEBAR_STYLE
@@ -1527,10 +1617,11 @@ def build_debar_list(input_path, output_path, date_str=None, notice_board=False,
             # Notice-board copies drop the trailing Student Signature
             # column entirely — nobody signs a sheet pinned to a board —
             # so n_cols has no +1 for it in that case.
-            n_cols = 3 + n_subjects + 2 + (0 if notice_board else 1)
-            final_avg_col = 3 + n_subjects + 1
-            shortage_col = 3 + n_subjects + 2
-            signature_col = None if notice_board else 3 + n_subjects + 3
+            first_subj = 4 + n_extra   # first subject column (phone columns sit before it)
+            n_cols = 3 + n_extra + n_subjects + 2 + (0 if notice_board else 1)
+            final_avg_col = 3 + n_extra + n_subjects + 1
+            shortage_col = 3 + n_extra + n_subjects + 2
+            signature_col = None if notice_board else 3 + n_extra + n_subjects + 3
             last_col_letter = get_column_letter(n_cols)
 
             name = sws.title[:31]
@@ -1546,6 +1637,9 @@ def build_debar_list(input_path, output_path, date_str=None, notice_board=False,
             ows.column_dimensions["C"].width = DEBAR_COL_C_W * col_scale
             for c in range(4, n_cols + 1):
                 ows.column_dimensions[get_column_letter(c)].width = DEBAR_COL_SUBJ_W
+            if add_phones:
+                ows.column_dimensions["D"].width = DEBAR_COL_PHONE_W
+                ows.column_dimensions["E"].width = DEBAR_COL_PHONE_W
             if signature_col is not None:
                 ows.column_dimensions[get_column_letter(signature_col)].width = DEBAR_COL_SIG_W
 
@@ -1590,7 +1684,9 @@ def build_debar_list(input_path, output_path, date_str=None, notice_board=False,
 
             # Row 3: header
             ows.row_dimensions[3].height = row3_h
-            header_values = ["Sl No.", "Roll No.", "Student Name"] + list(subject_headers) + \
+            header_values = ["Sl No.", "Roll No.", "Student Name"] + \
+                             (["Student Phone No.", "Parent Phone No."] if add_phones else []) + \
+                             list(subject_headers) + \
                              ["Final Avg", "No of subjects having Shortage"] + \
                              ([] if notice_board else ["Student Signature"])
             for i, val in enumerate(header_values):
@@ -1622,8 +1718,27 @@ def build_debar_list(input_path, output_path, date_str=None, notice_board=False,
                 c1 = ows.cell(row=row_out, column=1, value=sl_no); _dapply(c1, "dataSlNo", styles)
                 c2 = ows.cell(row=row_out, column=2, value=roll); _dapply(c2, "dataRoll", styles)
                 c3 = ows.cell(row=row_out, column=3, value=student_name); _dapply(c3, "dataName", styles)
+                if add_phones:
+                    phone_v = parent_v = None
+                    # only students actually short of the limit get tagged
+                    if isinstance(shortage_n, (int, float)) and shortage_n > 0:
+                        rk = canon_roll(roll)
+                        rec, how = match_master(master, roll, student_name)
+                        if rec is None:
+                            master_missing.setdefault(rk, (str(roll).strip(), str(student_name).strip()))
+                        else:
+                            phone_v, parent_v = rec["phone"] or None, rec["parent"] or None
+                            master_seen[rk] = (str(roll).strip(), str(student_name).strip())
+                            if how == "name":
+                                by_name_used.setdefault(rk, (str(roll).strip(), str(student_name).strip(), rec["roll"]))
+                            if not names_similar(student_name, rec["name"]):
+                                name_mismatch.setdefault(rk, (str(roll).strip(), str(student_name).strip(), rec["name"]))
+                            if rec["batch"] and canon_section(rec["batch"]) != canon_section(row_section):
+                                section_mismatch.setdefault(rk, (str(roll).strip(), row_section, rec["batch"]))
+                    _dapply(ows.cell(row=row_out, column=4, value=phone_v), "dataSubject", styles)
+                    _dapply(ows.cell(row=row_out, column=5, value=parent_v), "dataSubject", styles)
                 for i, v in enumerate(subj_vals):
-                    cell = ows.cell(row=row_out, column=4 + i, value=(None if v == "" else v))
+                    cell = ows.cell(row=row_out, column=first_subj + i, value=(None if v == "" else v))
                     _dapply(cell, "dataSubject", styles)
                     if v not in (None, ""):
                         counts[i] += 1
@@ -1647,8 +1762,8 @@ def build_debar_list(input_path, output_path, date_str=None, notice_board=False,
                     if c == 3:
                         cell.value = "No of students having shortage"
                         _dapply(cell, "footerLabel")
-                    elif 4 <= c <= 3 + n_subjects:
-                        cell.value = counts[c - 4]
+                    elif first_subj <= c <= first_subj + n_subjects - 1:
+                        cell.value = counts[c - first_subj]
                         _dapply(cell, "footerLabel")
                     else:
                         _dapply(cell, "footerCount")
@@ -1714,6 +1829,27 @@ def build_debar_list(input_path, output_path, date_str=None, notice_board=False,
 
     if sheets_done == 0:
         raise ValueError("No sheets could be processed — check that the input file has the expected columns.")
+
+    if add_phones:
+        def lines(d, fmt, cap=25):
+            items = [fmt(*v) for v in d.values()]
+            return items[:cap] + ([f"... and {len(items) - cap} more"] if len(items) > cap else [])
+        MASTER_WARNINGS.clear()
+        MASTER_WARNINGS.append(f"Phone numbers added for {len(master_seen)} student(s) from the master data set.")
+        if master_missing:
+            MASTER_WARNINGS.append(f"{len(master_missing)} shortage student(s) NOT FOUND in the master data set (no phone numbers): "
+                                   + "; ".join(lines(master_missing, lambda r, n: f"{r} {n}")))
+        if by_name_used:
+            MASTER_WARNINGS.append(f"{len(by_name_used)} student(s) matched by NAME because the roll no was not in the master data: "
+                                   + "; ".join(lines(by_name_used, lambda r, n, mr: f"{r} {n} (master roll {mr})")))
+        if name_mismatch:
+            MASTER_WARNINGS.append(f"{len(name_mismatch)} student(s) whose NAME differs from the master data: "
+                                   + "; ".join(lines(name_mismatch, lambda r, n, mn: f"{r}: report '{n}' vs master '{mn}'")))
+        if section_mismatch:
+            MASTER_WARNINGS.append(f"{len(section_mismatch)} student(s) whose SECTION differs from the master data: "
+                                   + "; ".join(lines(section_mismatch, lambda r, a, b: f"{r}: report '{a}' vs master '{b}'")))
+        for i, w in enumerate(MASTER_WARNINGS):
+            log.append(("(master data)", i == 0, w))
 
     out.save(output_path)
     return output_path, log
@@ -1943,7 +2079,9 @@ def run_downstream_reports(vms_report_path, raw_path, args):
 
     if not args.skip_debar:
         debar_output = args.debar_output or f"{base}_Debar.xlsx"
-        dout, log = build_debar_list(vms_report_path, debar_output, args.date, list_no=getattr(args, "list_no", "1"))
+        master = load_master_data(args.master) if getattr(args, "master", None) else None
+        dout, log = build_debar_list(vms_report_path, debar_output, args.date, list_no=getattr(args, "list_no", "1"),
+                                      master=master)
         print(f"Debar list saved: {dout}")
         for sheet_name, ok, detail in log:
             print(f"  {'OK' if ok else 'SKIPPED'} {sheet_name}: {detail}")
@@ -1981,6 +2119,7 @@ def main():
     p_format.add_argument("--batch-list", default=None, help="Path to a BCA/MCA Lab Batch List workbook — cross-references lab/internship faculty & batch by Reg No, and unlocks the abstract workbook")
     p_format.add_argument("--date", default=None, help="'as of' date shown in the debar list and abstract workbook, dd.mm.yyyy (default: today)")
     p_format.add_argument("--list-no", default="1", help="Tentative Debar List number shown in the title: 1, 2, 3 ... (shown as I, II, III)")
+    p_format.add_argument("--master", default=None, help="Master data set (.xlsx): adds student + parent phone numbers (Reg No col B, Name F, Batch J, Student phone AU, Parent phone AV) to the debar list; not added to the notice-board copy")
     p_format.add_argument("--program", default="BCA", help="Program name shown in the abstract workbook heading, e.g. 'BCA' or 'MCA'")
     p_format.add_argument("--debar-output", default=None, help="Debar list filename (default: derived from output)")
     p_format.add_argument("--abstract-output", default=None, help="Abstract workbook filename (default: derived from output); only built if --batch-list is given")
@@ -2005,6 +2144,7 @@ def main():
     p_debar.add_argument("output")
     p_debar.add_argument("--date", default=None, help="'as of' date shown in each title, dd.mm.yyyy (default: today)")
     p_debar.add_argument("--list-no", default="1", help="Tentative Debar List number shown in the title: 1, 2, 3 ... (shown as I, II, III)")
+    p_debar.add_argument("--master", default=None, help="Master data set (.xlsx): adds student + parent phone numbers (Reg No col B, Name F, Batch J, Student phone AU, Parent phone AV) to the debar list; not added to the notice-board copy")
 
     p_notice = sub.add_parser("notice", help="Build the notice-board copy of the Tentative Debar List (no legend/summary, bigger fonts) from a raw VMS export")
     p_notice.add_argument("input", nargs="?", default=None, help="Omit to auto-use the most recently generated VMS Report")
@@ -2033,6 +2173,7 @@ def main():
     p_pipeline.add_argument("--batch-list", default=None, help="Path to a BCA/MCA Lab Batch List workbook — cross-references lab/internship faculty & batch by Reg No, and unlocks the abstract workbook")
     p_pipeline.add_argument("--date", default=None, help="'as of' date shown in the debar list and abstract workbook, dd.mm.yyyy (default: today)")
     p_pipeline.add_argument("--list-no", default="1", help="Tentative Debar List number shown in the title: 1, 2, 3 ... (shown as I, II, III)")
+    p_pipeline.add_argument("--master", default=None, help="Master data set (.xlsx): adds student + parent phone numbers (Reg No col B, Name F, Batch J, Student phone AU, Parent phone AV) to the debar list; not added to the notice-board copy")
     p_pipeline.add_argument("--program", default="BCA", help="Program name shown in the abstract workbook heading, e.g. 'BCA' or 'MCA'")
     p_pipeline.add_argument("--debar-output", default=None, help="Debar list filename (default: derived from --output)")
     p_pipeline.add_argument("--abstract-output", default=None, help="Abstract workbook filename (default: derived from --output); only built if --batch-list is given")
@@ -2062,7 +2203,8 @@ def main():
         run_downstream_reports(out, args.input, args)
 
     elif args.mode == "debar":
-        out, log = build_debar_list(args.input, args.output, args.date, list_no=args.list_no)
+        master = load_master_data(args.master) if args.master else None
+        out, log = build_debar_list(args.input, args.output, args.date, list_no=args.list_no, master=master)
         print(f"Saved: {out}")
         for sheet_name, ok, detail in log:
             print(f"  {'OK' if ok else 'SKIPPED'} {sheet_name}: {detail}")
