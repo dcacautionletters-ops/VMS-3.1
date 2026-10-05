@@ -1,0 +1,10 @@
+   *.xlsx
+   *.xls
+   downloads/
+   debug_screenshots/
+   VMS Report/
+   Abstract Report/
+   Tentative Debar List/
+   Tentative Debar List (Notice Board)/
+   __pycache__/
+   .env
