@@ -427,11 +427,11 @@ def process_grid(rows, subjects, low_t, high_t, show_all, C):
 
     prows = list(pivot.values())
 
-    lab_re = LAB_RE
+    # Final Avg = mean of the student's attendance across EVERY subject
+    # (theory + lab) in the report — computed here, BEFORE the below-limit
+    # filter blanks out the subjects that are not in shortage, so it is the
+    # student's true overall average, not an average of shortage subjects.
     for row in prows:
-        th_subs = [s for s in subjects if not lab_re.search(s)]
-        th_vals = [row[s] for s in th_subs if row.get(s) is not None]
-        row["Theory Avg"] = r2(sum(th_vals) / len(th_vals)) if th_vals else None
         all_vals = [row[s] for s in subjects if row.get(s) is not None]
         row["Final Avg"] = r2(sum(all_vals) / len(all_vals)) if all_vals else None
 
@@ -466,7 +466,6 @@ def process_grid(rows, subjects, low_t, high_t, show_all, C):
                  C["sem"]: f"Count ({low_t}-{high_t}%)"}
     for s in subjects:
         count_row[s] = counts[s]
-    count_row["Theory Avg"] = ""
     count_row["Final Avg"] = ""
     count_row["Subjects in Range"] = ""
     prows.append(count_row)
@@ -512,12 +511,11 @@ def write_sheet(wb, sname, grid_rows, raw_rows, subjects, threshold, C):
     ws = wb.create_sheet(title=sname[:31])
 
     cols = ["Sl No.", C["roll"], C["name"], C["batch"], C["sem"], *subjects,
-            "Theory Avg", "Final Avg", "Subjects in Range"]
+            "Final Avg", "Subjects in Range"]
     sub_start = 5
     sub_end = 5 + len(subjects) - 1
-    th_avg_col = sub_end + 1
-    fn_avg_col = sub_end + 2
-    sir_col = sub_end + 3
+    fn_avg_col = sub_end + 1
+    sir_col = sub_end + 2
 
     for ci, c in enumerate(cols):
         cell = ws.cell(row=1, column=ci + 1, value=c)
@@ -528,7 +526,7 @@ def write_sheet(wb, sname, grid_rows, raw_rows, subjects, threshold, C):
         cell.border = BORDER
     ws.row_dimensions[1].height = 62.4
 
-    widths = [5, 13, 41, 12, 8] + [20] * len(subjects) + [12, 12, 14]
+    widths = [5, 13, 41, 12, 8] + [20] * len(subjects) + [12, 14]
     for i, w in enumerate(widths):
         ws.column_dimensions[get_column_letter(i + 1)].width = w
 
@@ -566,7 +564,7 @@ def write_sheet(wb, sname, grid_rows, raw_rows, subjects, threshold, C):
                     elif n < threshold:
                         cell.fill = GREEN_FILL; cell.font = BLACK_BOLD
 
-                if ci in (th_avg_col, fn_avg_col) and has_val:
+                if ci == fn_avg_col and has_val:
                     if n < 70:
                         cell.fill = RED_FILL; cell.font = WHITE_BOLD
                     elif n < threshold:
@@ -1602,17 +1600,16 @@ def build_debar_list(input_path, output_path, date_str=None, notice_board=False,
             def find_idx(name):
                 return headers.index(name) if name in headers else -1
 
-            idx_theory = find_idx("Theory Avg")
             idx_final = find_idx("Final Avg")
             idx_range = find_idx("Subjects in Range")
 
-            if idx_theory == -1 or idx_final == -1 or idx_range == -1:
-                log.append((sws.title, False, "Missing 'Theory Avg' / 'Final Avg' / 'Subjects in Range' column — sheet skipped."))
+            if idx_final == -1 or idx_range == -1:
+                log.append((sws.title, False, "Missing 'Final Avg' / 'Subjects in Range' column — sheet skipped."))
                 continue
 
-            # subject headers sit in columns F.. up to (not incl.) Theory Avg
-            # -> 0-based slice(5, idx_theory)
-            subject_headers = headers[5:idx_theory]
+            # subject headers sit in columns F.. up to (not incl.) Final Avg
+            # -> 0-based slice(5, idx_final)
+            subject_headers = headers[5:idx_final]
             n_subjects = len(subject_headers)
             # Notice-board copies drop the trailing Student Signature
             # column entirely — nobody signs a sheet pinned to a board —
