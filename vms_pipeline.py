@@ -446,16 +446,22 @@ def sem_label(sem_str):
 
 
 ABSTRACT_BUCKETS = [
-    (0.00, 29.99), (30.00, 49.99), (50.00, 59.99),
-    (60.00, 64.49), (64.50, 69.99), (70.00, 74.99),
+    (0.00, 30.00), (30.01, 45.00), (45.01, 59.00), (59.01, 74.00),
+    (74.01, 100.00),
 ]
-ABSTRACT_BUCKET_LABELS = ["0.00-29.99", "30.00-49.99", "50.00-59.99",
-                           "60.00-64.49", "64.50-69.99", "70.00-74.99"]
+ABSTRACT_BUCKET_LABELS = ["0.00-30.00", "30.01-45.00", "45.01-59.00",
+                           "59.01-74.00", "74.01-100.00"]
+N_BUCKETS = len(ABSTRACT_BUCKETS)
+
+# True  -> "Total" = every student of that subject (all 5 bands)
+# False -> "Total" = shortage students only (first 4 bands, as before)
+ABSTRACT_TOTAL_INCLUDES_ABOVE_74 = True
 
 
 def bucket_index(pct):
-    """Which of the 6 shortage bands (0-74.99%) `pct` falls into, or None
-    if `pct` is >=75% (not a shortage case) or unparseable."""
+    """Which attendance band `pct` falls into (0..4), or None if it is
+    unparseable / outside 0-100. Values are rounded to 2 decimals first,
+    so the .01 gaps between bands can never swallow a student."""
     try:
         p = round(float(pct), 2)
     except (TypeError, ValueError):
@@ -464,6 +470,10 @@ def bucket_index(pct):
         if lo - 1e-9 <= p <= hi + 1e-9:
             return i
     return None
+
+
+def _bucket_total(buckets):
+    return sum(buckets) if ABSTRACT_TOTAL_INCLUDES_ABOVE_74 else sum(buckets[:-1])
 
 
 def process_grid(rows, subjects, low_t, high_t, show_all, C):
@@ -1253,16 +1263,21 @@ def _french_one_row_per_student(srows, C):
     return [v[1] for v in chosen.values()]
 
 
+ABSTRACT_FIRST_BUCKET_COL = 4
+ABSTRACT_TOTAL_COL = ABSTRACT_FIRST_BUCKET_COL + N_BUCKETS      # 9
+ABSTRACT_LAST_COL = ABSTRACT_TOTAL_COL
+
+
 def _abstract_section_rows(section, subject_rows, C, batch_map, batch_groups=None):
     """For one section, one row per subject — or one per GROUP, a
     (batch_label, faculty) pair, when a subject has several. Every group the
     Batch List defines for the subject is shown, EVEN IF it has zero
-    shortage students (a batch with no shortage used to vanish whenever
-    another batch of the same lab had shortage). French always appears as a
-    single row under FRENCH_FACULTY."""
+    students in a band. French always appears as a single row under
+    FRENCH_FACULTY. Each row also carries the raw faculty name under "fac"
+    (no batch label) so the consolidated sheet can add sections together."""
     subjects = get_subjects(subject_rows, C)
     out_rows = []
-    key_section = canon_section(section)  # batch_map/batch_groups are keyed by canon_section()
+    key_section = canon_section(section)
     for subj in subjects:
         subj_key = str(subj).strip()
         is_french = bool(FRENCH_RE.search(subj_key))
@@ -1270,7 +1285,7 @@ def _abstract_section_rows(section, subject_rows, C, batch_map, batch_groups=Non
         if is_french:
             srows = _french_one_row_per_student(srows, C)
 
-        by_group = {}      # (batch_label, faculty) -> [6 bucket counts]
+        by_group = {}
         all_groups = set()
         for r in srows:
             roll = str(r.get(C["roll"]) or "").strip()
@@ -1288,7 +1303,7 @@ def _abstract_section_rows(section, subject_rows, C, batch_map, batch_groups=Non
             all_groups.add(group_key)
             if bidx is None:
                 continue
-            by_group.setdefault(group_key, [0] * 6)[bidx] += 1
+            by_group.setdefault(group_key, [0] * N_BUCKETS)[bidx] += 1
 
         if is_french:
             zero_groups = {(None, FRENCH_FACULTY)}
@@ -1296,104 +1311,148 @@ def _abstract_section_rows(section, subject_rows, C, batch_map, batch_groups=Non
             bg = (batch_groups or {}).get((key_section, subj_key))
             zero_groups = set(bg) if bg else set(all_groups)
         for g in zero_groups:
-            by_group.setdefault(g, [0] * 6)
+            by_group.setdefault(g, [0] * N_BUCKETS)
 
         if not by_group:
-            out_rows.append({"subject": subj, "faculty": "", "buckets": [0] * 6, "total": 0})
+            out_rows.append({"subject": subj, "faculty": "", "fac": "",
+                             "buckets": [0] * N_BUCKETS, "total": 0})
             continue
         for batch_label, fac in sorted(by_group, key=group_sort_key):
             buckets = by_group[(batch_label, fac)]
             display = group_label(batch_label, fac) if batch_label else fac
-            out_rows.append({"subject": subj, "faculty": display, "buckets": buckets, "total": sum(buckets)})
+            out_rows.append({"subject": subj, "faculty": display, "fac": fac,
+                             "buckets": buckets, "total": _bucket_total(buckets)})
     return out_rows
 
 
-def write_abstract_sheet(ws, sections, G, C, batch_map, date_str=None, program="BCA", sem_heading="", batch_groups=None):
+def _consolidate_rows(entry_lists):
+    """Add the per-section rows together: one row per (subject, faculty),
+    summed over every section, plus an 'ALL FACULTY' subtotal row for any
+    subject that has more than one faculty."""
+    agg = {}
+    for entries in entry_lists:
+        for e in entries:
+            key = (e["subject"], e.get("fac") or e["faculty"])
+            slot = agg.setdefault(key, [0] * N_BUCKETS)
+            for i, v in enumerate(e["buckets"]):
+                slot[i] += v
+
+    out = []
+    for subj in sorted({k[0] for k in agg}, key=lambda s: str(s).upper()):
+        facs = sorted(k[1] for k in agg if k[0] == subj)
+        if len(facs) > 1:                       # drop blank placeholder rows
+            facs = [f for f in facs if f] or facs
+        for fac in facs:
+            b = agg[(subj, fac)]
+            out.append({"subject": subj, "faculty": fac, "buckets": b,
+                        "total": _bucket_total(b)})
+        if len(facs) > 1:
+            tb = [sum(agg[(subj, f)][i] for f in facs) for i in range(N_BUCKETS)]
+            out.append({"subject": subj, "faculty": "ALL FACULTY", "buckets": tb,
+                        "total": _bucket_total(tb), "subtotal": True})
+    return out
+
+
+def _abstract_sheet_setup(ws, title_text):
     ws.sheet_view.showGridLines = False
     ws.column_dimensions["A"].width = ABSTRACT_COL_SECTION_W
     ws.column_dimensions["B"].width = ABSTRACT_COL_SUBJECT_W
     ws.column_dimensions["C"].width = ABSTRACT_COL_FACULTY_W
-    for i in range(6):
-        ws.column_dimensions[get_column_letter(4 + i)].width = ABSTRACT_COL_BUCKET_W
-    ws.column_dimensions[get_column_letter(10)].width = ABSTRACT_COL_TOTAL_W
+    for i in range(N_BUCKETS):
+        ws.column_dimensions[get_column_letter(ABSTRACT_FIRST_BUCKET_COL + i)].width = ABSTRACT_COL_BUCKET_W
+    ws.column_dimensions[get_column_letter(ABSTRACT_TOTAL_COL)].width = ABSTRACT_COL_TOTAL_W
 
-    hdr_style = _abstract_style(bold=True, fill=HEADER_FILL)
-    subj_style = _abstract_style(bold=True, wrap=True)
-    fac_style = _abstract_style(bold=False)
-    count_style = _abstract_style(bold=False)
-    total_style = _abstract_style(bold=True)
-    sec_style = _abstract_style(bold=True, wrap=True)
-    title_style = _abstract_style(bold=True)
-
-    last_col_letter = get_column_letter(10)
-
-    # Row 1: Presidency logo
     ws.row_dimensions[1].height = ABSTRACT_ROW1_H
     if os.path.exists(LOGO_PATH):
         img = XLImage(LOGO_PATH)
         img.width, img.height = DEBAR_LOGO_W, DEBAR_LOGO_H
         ws.add_image(img, "A1")
 
-    # Row 2: heading, e.g. "I SEM BCA ABSTRACT AS OF 07.09.2026"
     ws.row_dimensions[2].height = ABSTRACT_ROW2_H
-    ws.merge_cells(f"A2:{last_col_letter}2")
+    ws.merge_cells(f"A2:{get_column_letter(ABSTRACT_LAST_COL)}2")
     title_cell = ws.cell(row=2, column=1)
-    title_cell.value = f"{sem_heading} SEM {program} ABSTRACT AS OF {date_str}".strip()
-    _abstract_apply(title_cell, title_style)
+    title_cell.value = title_text.strip()
+    _abstract_apply(title_cell, _abstract_style(bold=True))
 
+
+def _write_abstract_block(ws, r, section_label, rows):
+    """Write one header + table block starting at row r (SECTION merged down
+    the block, SUBJECT merged per subject). Returns the next free row."""
+    hdr_style = _abstract_style(bold=True, fill=HEADER_FILL)
+    subj_style = _abstract_style(bold=True, wrap=True)
+    fac_style = _abstract_style(bold=False)
+    count_style = _abstract_style(bold=False)
+    total_style = _abstract_style(bold=True)
+    sec_style = _abstract_style(bold=True, wrap=True)
+    sub_fill = PatternFill(fgColor="D9E1F2", fill_type="solid")
+
+    headers = ["SECTION", "Subject", "FACULTY INCHARGE"] + ABSTRACT_BUCKET_LABELS + ["Total"]
+    for c, label in enumerate(headers, start=1):
+        _abstract_apply(ws.cell(row=r, column=c, value=label), hdr_style)
+    ws.row_dimensions[r].height = ABSTRACT_ROW_H
+    r += 1
+
+    first = r
+    for entry in rows:
+        ws.row_dimensions[r].height = ABSTRACT_ROW_H
+        is_sub = entry.get("subtotal", False)
+        fcell = ws.cell(row=r, column=3, value=entry["faculty"])
+        _abstract_apply(fcell, total_style if is_sub else fac_style)
+        for i, v in enumerate(entry["buckets"]):
+            _abstract_apply(ws.cell(row=r, column=ABSTRACT_FIRST_BUCKET_COL + i, value=v),
+                            total_style if is_sub else count_style)
+        _abstract_apply(ws.cell(row=r, column=ABSTRACT_TOTAL_COL, value=entry["total"]), total_style)
+        if is_sub:
+            for c in range(3, ABSTRACT_LAST_COL + 1):
+                ws.cell(row=r, column=c).fill = sub_fill
+        r += 1
+    last = r - 1
+
+    i = first
+    while i <= last:
+        subj = rows[i - first]["subject"]
+        j = i
+        while j + 1 <= last and rows[j + 1 - first]["subject"] == subj:
+            j += 1
+        ws.merge_cells(start_row=i, start_column=2, end_row=j, end_column=2)
+        _abstract_apply(ws.cell(row=i, column=2, value=subj), subj_style)
+        for rr in range(i, j + 1):
+            ws.cell(row=rr, column=2).border = BORDER
+        i = j + 1
+
+    ws.merge_cells(start_row=first, start_column=1, end_row=last, end_column=1)
+    _abstract_apply(ws.cell(row=first, column=1, value=section_label), sec_style)
+    for rr in range(first, last + 1):
+        ws.cell(row=rr, column=1).border = BORDER
+
+    return last + 3   # 2 blank rows between blocks
+
+
+def write_abstract_sheet(ws, sections, G, C, batch_map, date_str=None, program="BCA", sem_heading="", batch_groups=None):
+    """Section-wise sheet: one block per section."""
+    _abstract_sheet_setup(ws, f"{sem_heading} SEM {program} ABSTRACT AS OF {date_str}")
     r = 3
     for section in sections:
         sec_rows = [row for row in G if str(row.get(C["batch"]) or "").strip().replace("/", "-") == section]
         rows_for_section = _abstract_section_rows(section, sec_rows, C, batch_map, batch_groups)
         if not rows_for_section:
             continue
+        r = _write_abstract_block(ws, r, section, rows_for_section)
 
-        header_row = r
-        headers = ["SECTION", "Subject", "FACULTY INCHARGE"] + ABSTRACT_BUCKET_LABELS + ["Total"]
-        for c, label in enumerate(headers, start=1):
-            cell = ws.cell(row=header_row, column=c, value=label)
-            _abstract_apply(cell, hdr_style)
-        ws.row_dimensions[header_row].height = ABSTRACT_ROW_H
-        r += 1
 
-        section_first_row = r
-        subj_first_row = {}
-        for entry in rows_for_section:
-            ws.row_dimensions[r].height = ABSTRACT_ROW_H
-            if entry["subject"] not in subj_first_row:
-                subj_first_row[entry["subject"]] = r
-            fcell = ws.cell(row=r, column=3, value=entry["faculty"])
-            _abstract_apply(fcell, fac_style)
-            for i, v in enumerate(entry["buckets"]):
-                ccell = ws.cell(row=r, column=4 + i, value=v)
-                _abstract_apply(ccell, count_style)
-            tcell = ws.cell(row=r, column=10, value=entry["total"])
-            _abstract_apply(tcell, total_style)
-            r += 1
-        section_last_row = r - 1
-
-        # merge SUBJECT vertically for subjects with more than one faculty row
-        i = section_first_row
-        while i <= section_last_row:
-            subj = rows_for_section[i - section_first_row]["subject"]
-            j = i
-            while j + 1 <= section_last_row and rows_for_section[j + 1 - section_first_row]["subject"] == subj:
-                j += 1
-            ws.merge_cells(start_row=i, start_column=2, end_row=j, end_column=2)
-            scell = ws.cell(row=i, column=2, value=subj)
-            _abstract_apply(scell, subj_style)
-            for rr in range(i, j + 1):
-                ws.cell(row=rr, column=2).border = BORDER
-            i = j + 1
-
-        # merge SECTION for the whole block
-        ws.merge_cells(start_row=section_first_row, start_column=1, end_row=section_last_row, end_column=1)
-        secell = ws.cell(row=section_first_row, column=1, value=section)
-        _abstract_apply(secell, sec_style)
-        for rr in range(section_first_row, section_last_row + 1):
-            ws.cell(row=rr, column=1).border = BORDER
-
-        r = section_last_row + 3  # 2 blank rows between section blocks
+def write_abstract_consolidated_sheet(ws, sections, G, C, batch_map, date_str=None, program="BCA", sem_heading="", batch_groups=None):
+    """Semester-wise consolidated sheet: every section of the semester added
+    together into a single table (per subject / faculty)."""
+    _abstract_sheet_setup(ws, f"{sem_heading} SEM {program} CONSOLIDATED ABSTRACT (ALL SECTIONS) AS OF {date_str}")
+    entry_lists = []
+    for section in sections:
+        sec_rows = [row for row in G if str(row.get(C["batch"]) or "").strip().replace("/", "-") == section]
+        entries = _abstract_section_rows(section, sec_rows, C, batch_map, batch_groups)
+        if entries:
+            entry_lists.append(entries)
+    rows = _consolidate_rows(entry_lists)
+    if rows:
+        _write_abstract_block(ws, 3, "ALL SECTIONS", rows)
 
 
 def build_abstract(input_path, batch_list_path, output_path, date_str=None, program="BCA"):
@@ -1479,10 +1538,16 @@ def build_abstract(input_path, batch_list_path, output_path, date_str=None, prog
     wb.remove(wb.active)
     for sem in sems_present:
         sections = sorted(s for s, sv in section_sem.items() if sv == sem)
+
         sheet_name = f"SUB {sem_label(sem)} SEM"[:31]
         ws = wb.create_sheet(sheet_name)
         write_abstract_sheet(ws, sections, G, C, batch_map, date_str=date_str, program=program,
                               sem_heading=sem_label(sem), batch_groups=batch_groups)
+
+        ws_all = wb.create_sheet(f"SUB {sem_label(sem)} SEM CONSOLIDATED"[:31])
+        write_abstract_consolidated_sheet(ws_all, sections, G, C, batch_map, date_str=date_str,
+                                          program=program, sem_heading=sem_label(sem),
+                                          batch_groups=batch_groups)
 
     if not wb.sheetnames:
         raise ValueError("No abstract sheets generated.")
