@@ -46,6 +46,7 @@ import re
 import time
 from collections import Counter
 
+from openpyxl.worksheet.hyperlink import Hyperlink
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -453,11 +454,6 @@ ABSTRACT_BUCKET_LABELS = ["0.00-30.00", "30.01-45.00", "45.01-59.00",
                            "59.01-74.00", "74.01-100.00"]
 N_BUCKETS = len(ABSTRACT_BUCKETS)
 
-# True  -> "Total" = every student of that subject (all 5 bands)
-# False -> "Total" = shortage students only (first 4 bands, as before)
-ABSTRACT_TOTAL_INCLUDES_ABOVE_74 = True
-
-
 def bucket_index(pct):
     """Which attendance band `pct` falls into (0..4), or None if it is
     unparseable / outside 0-100. Values are rounded to 2 decimals first,
@@ -470,10 +466,6 @@ def bucket_index(pct):
         if lo - 1e-9 <= p <= hi + 1e-9:
             return i
     return None
-
-
-def _bucket_total(buckets):
-    return sum(buckets) if ABSTRACT_TOTAL_INCLUDES_ABOVE_74 else sum(buckets[:-1])
 
 
 def process_grid(rows, subjects, low_t, high_t, show_all, C):
@@ -1222,7 +1214,7 @@ ABSTRACT_COL_SECTION_W = 16
 ABSTRACT_COL_SUBJECT_W = 34
 ABSTRACT_COL_FACULTY_W = 26
 ABSTRACT_COL_BUCKET_W = 12
-ABSTRACT_COL_TOTAL_W = 9
+ABSTRACT_COL_TOTAL_W = 14
 ABSTRACT_ROW_H = 22
 ABSTRACT_ROW1_H, ABSTRACT_ROW2_H = 54.6, 23.4  # logo row, title row — same as the debar list
 
@@ -1264,8 +1256,13 @@ def _french_one_row_per_student(srows, C):
 
 
 ABSTRACT_FIRST_BUCKET_COL = 4
-ABSTRACT_TOTAL_COL = ABSTRACT_FIRST_BUCKET_COL + N_BUCKETS      # 9
+ABSTRACT_SHORTAGE_COL = ABSTRACT_FIRST_BUCKET_COL + N_BUCKETS      # 9  (formula: sum of the 4 shortage bands)
+ABSTRACT_TOTAL_COL = ABSTRACT_SHORTAGE_COL + 1                      # 10 (Total Strength)
 ABSTRACT_LAST_COL = ABSTRACT_TOTAL_COL
+ABSTRACT_COL_SHORT_W = 12
+SHORT_BANDS = N_BUCKETS - 1          # the first 4 bands are shortage (<= 74.00); the last is 74.01-100
+SHORTAGE_LABEL = "SHORTAGE (0.00-74.00)"
+LINK_COLOR = "0563C1"
 
 
 def _abstract_section_rows(section, subject_rows, C, batch_map, batch_groups=None):
@@ -1273,11 +1270,14 @@ def _abstract_section_rows(section, subject_rows, C, batch_map, batch_groups=Non
     (batch_label, faculty) pair, when a subject has several. Every group the
     Batch List defines for the subject is shown, EVEN IF it has zero
     students in a band. French always appears as a single row under
-    FRENCH_FACULTY. Each row also carries the raw faculty name under "fac"
-    (no batch label) so the consolidated sheet can add sections together."""
+    FRENCH_FACULTY. Each row carries the raw faculty name under "fac" (so
+    the consolidated sheet can add sections together) and the actual
+    students of every band under "students" (used for the click-through
+    student lists)."""
     subjects = get_subjects(subject_rows, C)
     out_rows = []
     key_section = canon_section(section)
+    empty = lambda: [[] for _ in range(N_BUCKETS)]
     for subj in subjects:
         subj_key = str(subj).strip()
         is_french = bool(FRENCH_RE.search(subj_key))
@@ -1289,6 +1289,7 @@ def _abstract_section_rows(section, subject_rows, C, batch_map, batch_groups=Non
         all_groups = set()
         for r in srows:
             roll = str(r.get(C["roll"]) or "").strip()
+            name = str(r.get(C["name"]) or "").strip()
             bidx = bucket_index(r.get(C["attendance"]))
             if is_french:
                 batch_label, fac = None, FRENCH_FACULTY
@@ -1303,7 +1304,8 @@ def _abstract_section_rows(section, subject_rows, C, batch_map, batch_groups=Non
             all_groups.add(group_key)
             if bidx is None:
                 continue
-            by_group.setdefault(group_key, [0] * N_BUCKETS)[bidx] += 1
+            pct = round(float(r.get(C["attendance"])), 2)
+            by_group.setdefault(group_key, empty())[bidx].append((roll, name, pct))
 
         if is_french:
             zero_groups = {(None, FRENCH_FACULTY)}
@@ -1311,45 +1313,41 @@ def _abstract_section_rows(section, subject_rows, C, batch_map, batch_groups=Non
             bg = (batch_groups or {}).get((key_section, subj_key))
             zero_groups = set(bg) if bg else set(all_groups)
         for g in zero_groups:
-            by_group.setdefault(g, [0] * N_BUCKETS)
+            by_group.setdefault(g, empty())
 
         if not by_group:
-            out_rows.append({"subject": subj, "faculty": "", "fac": "",
-                             "buckets": [0] * N_BUCKETS, "total": 0})
+            out_rows.append({"subject": subj, "faculty": "", "fac": "", "buckets": [0] * N_BUCKETS,
+                             "total": 0, "students": empty()})
             continue
         for batch_label, fac in sorted(by_group, key=group_sort_key):
-            buckets = by_group[(batch_label, fac)]
+            lists = by_group[(batch_label, fac)]
             display = group_label(batch_label, fac) if batch_label else fac
+            lists = [[(ro, nm, p, section, display) for ro, nm, p in lst] for lst in lists]
             out_rows.append({"subject": subj, "faculty": display, "fac": fac,
-                             "buckets": buckets, "total": _bucket_total(buckets)})
+                             "buckets": [len(x) for x in lists], "total": sum(len(x) for x in lists),
+                             "students": lists})
     return out_rows
 
 
 def _consolidate_rows(entry_lists):
-    """Add the per-section rows together: one row per (subject, faculty),
-    summed over every section, plus an 'ALL FACULTY' subtotal row for any
-    subject that has more than one faculty."""
+    """Add the per-section rows together: ONE row per subject, summed over
+    every section. FACULTY INCHARGE shows the faculty's name when only one
+    faculty teaches the subject, otherwise 'ALL FACULTY'."""
     agg = {}
     for entries in entry_lists:
         for e in entries:
-            key = (e["subject"], e.get("fac") or e["faculty"])
-            slot = agg.setdefault(key, [0] * N_BUCKETS)
-            for i, v in enumerate(e["buckets"]):
-                slot[i] += v
-
+            slot = agg.setdefault(e["subject"], {"facs": set(), "students": [[] for _ in range(N_BUCKETS)]})
+            if e.get("fac"):
+                slot["facs"].add(e["fac"])
+            for i, lst in enumerate(e["students"]):
+                slot["students"][i].extend(lst)
     out = []
-    for subj in sorted({k[0] for k in agg}, key=lambda s: str(s).upper()):
-        facs = sorted(k[1] for k in agg if k[0] == subj)
-        if len(facs) > 1:                       # drop blank placeholder rows
-            facs = [f for f in facs if f] or facs
-        for fac in facs:
-            b = agg[(subj, fac)]
-            out.append({"subject": subj, "faculty": fac, "buckets": b,
-                        "total": _bucket_total(b)})
-        if len(facs) > 1:
-            tb = [sum(agg[(subj, f)][i] for f in facs) for i in range(N_BUCKETS)]
-            out.append({"subject": subj, "faculty": "ALL FACULTY", "buckets": tb,
-                        "total": _bucket_total(tb), "subtotal": True})
+    for subj in sorted(agg, key=lambda s: str(s).upper()):
+        facs = sorted(agg[subj]["facs"])
+        fac = facs[0] if len(facs) == 1 else ("ALL FACULTY" if facs else "")
+        lists = agg[subj]["students"]
+        out.append({"subject": subj, "faculty": fac, "fac": fac, "buckets": [len(x) for x in lists],
+                    "total": sum(len(x) for x in lists), "students": lists})
     return out
 
 
@@ -1360,6 +1358,7 @@ def _abstract_sheet_setup(ws, title_text):
     ws.column_dimensions["C"].width = ABSTRACT_COL_FACULTY_W
     for i in range(N_BUCKETS):
         ws.column_dimensions[get_column_letter(ABSTRACT_FIRST_BUCKET_COL + i)].width = ABSTRACT_COL_BUCKET_W
+    ws.column_dimensions[get_column_letter(ABSTRACT_SHORTAGE_COL)].width = ABSTRACT_COL_SHORT_W
     ws.column_dimensions[get_column_letter(ABSTRACT_TOTAL_COL)].width = ABSTRACT_COL_TOTAL_W
 
     ws.row_dimensions[1].height = ABSTRACT_ROW1_H
@@ -1375,18 +1374,20 @@ def _abstract_sheet_setup(ws, title_text):
     _abstract_apply(title_cell, _abstract_style(bold=True))
 
 
-def _write_abstract_block(ws, r, section_label, rows):
+def _write_abstract_block(ws, r, section_label, rows, links=None, part="section"):
     """Write one header + table block starting at row r (SECTION merged down
-    the block, SUBJECT merged per subject). Returns the next free row."""
+    the block, SUBJECT merged per subject). Every non-zero shortage-band cell
+    and the Shortage cell is registered in `links` so it can later be
+    hyperlinked to the student list. Returns the next free row."""
     hdr_style = _abstract_style(bold=True, fill=HEADER_FILL)
     subj_style = _abstract_style(bold=True, wrap=True)
     fac_style = _abstract_style(bold=False)
     count_style = _abstract_style(bold=False)
     total_style = _abstract_style(bold=True)
     sec_style = _abstract_style(bold=True, wrap=True)
-    sub_fill = PatternFill(fgColor="D9E1F2", fill_type="solid")
 
-    headers = ["SECTION", "Subject", "FACULTY INCHARGE"] + ABSTRACT_BUCKET_LABELS + ["Total"]
+    headers = (["SECTION", "Subject", "FACULTY INCHARGE"] + ABSTRACT_BUCKET_LABELS
+               + ["Shortage", "Total Strength"])
     for c, label in enumerate(headers, start=1):
         _abstract_apply(ws.cell(row=r, column=c, value=label), hdr_style)
     ws.row_dimensions[r].height = ABSTRACT_ROW_H
@@ -1395,16 +1396,24 @@ def _write_abstract_block(ws, r, section_label, rows):
     first = r
     for entry in rows:
         ws.row_dimensions[r].height = ABSTRACT_ROW_H
-        is_sub = entry.get("subtotal", False)
-        fcell = ws.cell(row=r, column=3, value=entry["faculty"])
-        _abstract_apply(fcell, total_style if is_sub else fac_style)
+        _abstract_apply(ws.cell(row=r, column=3, value=entry["faculty"]), fac_style)
         for i, v in enumerate(entry["buckets"]):
-            _abstract_apply(ws.cell(row=r, column=ABSTRACT_FIRST_BUCKET_COL + i, value=v),
-                            total_style if is_sub else count_style)
+            col = ABSTRACT_FIRST_BUCKET_COL + i
+            _abstract_apply(ws.cell(row=r, column=col, value=v), count_style)
+            if links is not None and i < SHORT_BANDS and v > 0:
+                links.append(dict(ws=ws, row=r, col=col, part=part, section=section_label,
+                                  subject=entry["subject"], faculty=entry["faculty"],
+                                  band=ABSTRACT_BUCKET_LABELS[i], students=entry["students"][i]))
+        shortage_formula = "=" + "+".join(
+            f"{get_column_letter(ABSTRACT_FIRST_BUCKET_COL + i)}{r}" for i in range(SHORT_BANDS))
+        _abstract_apply(ws.cell(row=r, column=ABSTRACT_SHORTAGE_COL, value=shortage_formula), count_style)
         _abstract_apply(ws.cell(row=r, column=ABSTRACT_TOTAL_COL, value=entry["total"]), total_style)
-        if is_sub:
-            for c in range(3, ABSTRACT_LAST_COL + 1):
-                ws.cell(row=r, column=c).fill = sub_fill
+        short_students = sorted((s for lst in entry["students"][:SHORT_BANDS] for s in lst),
+                                key=lambda s: (s[2], s[1]))
+        if links is not None and short_students:
+            links.append(dict(ws=ws, row=r, col=ABSTRACT_SHORTAGE_COL, part=part, section=section_label,
+                              subject=entry["subject"], faculty=entry["faculty"],
+                              band=SHORTAGE_LABEL, students=short_students))
         r += 1
     last = r - 1
 
@@ -1428,7 +1437,8 @@ def _write_abstract_block(ws, r, section_label, rows):
     return last + 3   # 2 blank rows between blocks
 
 
-def write_abstract_sheet(ws, sections, G, C, batch_map, date_str=None, program="BCA", sem_heading="", batch_groups=None):
+def write_abstract_sheet(ws, sections, G, C, batch_map, date_str=None, program="BCA", sem_heading="",
+                         batch_groups=None, links=None):
     """Section-wise sheet: one block per section."""
     _abstract_sheet_setup(ws, f"{sem_heading} SEM {program} ABSTRACT AS OF {date_str}")
     r = 3
@@ -1437,12 +1447,13 @@ def write_abstract_sheet(ws, sections, G, C, batch_map, date_str=None, program="
         rows_for_section = _abstract_section_rows(section, sec_rows, C, batch_map, batch_groups)
         if not rows_for_section:
             continue
-        r = _write_abstract_block(ws, r, section, rows_for_section)
+        r = _write_abstract_block(ws, r, section, rows_for_section, links, "section")
 
 
-def write_abstract_consolidated_sheet(ws, sections, G, C, batch_map, date_str=None, program="BCA", sem_heading="", batch_groups=None):
+def write_abstract_consolidated_sheet(ws, sections, G, C, batch_map, date_str=None, program="BCA",
+                                      sem_heading="", batch_groups=None, links=None):
     """Semester-wise consolidated sheet: every section of the semester added
-    together into a single table (per subject / faculty)."""
+    together — one row per subject."""
     _abstract_sheet_setup(ws, f"{sem_heading} SEM {program} CONSOLIDATED ABSTRACT (ALL SECTIONS) AS OF {date_str}")
     entry_lists = []
     for section in sections:
@@ -1452,7 +1463,83 @@ def write_abstract_consolidated_sheet(ws, sections, G, C, batch_map, date_str=No
             entry_lists.append(entries)
     rows = _consolidate_rows(entry_lists)
     if rows:
-        _write_abstract_block(ws, 3, "ALL SECTIONS", rows)
+        _write_abstract_block(ws, 3, "ALL SECTIONS", rows, links, "all")
+
+
+def write_shortage_detail_sheet(ws, links, sem_heading, date_str, program="BCA"):
+    """Student lists behind the abstract numbers. One block per clickable
+    cell (title row + column headings + one row per student). The abstract
+    cell is hyperlinked to its block; each block has a link back."""
+    ws.sheet_view.showGridLines = False
+    for col, w in zip("ABCDEFG", (7, 16, 34, 20, 14, 36, 20)):
+        ws.column_dimensions[col].width = w
+    title = f"{sem_heading} SEM {program} SHORTAGE STUDENT LISTS AS OF {date_str}"
+    ws.merge_cells("A1:G1")
+    _abstract_apply(ws.cell(row=1, column=1, value=title), _abstract_style(bold=True))
+    ws.row_dimensions[1].height = ABSTRACT_ROW2_H
+    note = ws.cell(row=2, column=1, value="Click any shortage number on the abstract sheets to jump to its student list here; "
+                   "use 'Back to abstract' to return.")
+    note.font = Font(name="Calibri", size=10, italic=True)
+    ws.merge_cells("A2:G2")
+
+    banner_fill = PatternFill(fgColor="2C3E50", fill_type="solid")
+    block_fill = PatternFill(fgColor="D9E1F2", fill_type="solid")
+    head_style = _abstract_style(bold=True, fill=HEADER_FILL)
+    cell_style = _abstract_style()
+    name_style = dict(cell_style, alignment=Alignment(horizontal="left", vertical="center"))
+    link_font = Font(name="Calibri", size=11, color=LINK_COLOR, underline="single")
+    dname = ws.title.replace("'", "''")
+
+    r = 4
+    for part, banner in (("section", "SECTION-WISE LISTS"), ("all", "CONSOLIDATED LISTS (ALL SECTIONS)")):
+        part_links = [l for l in links if l["part"] == part]
+        if not part_links:
+            continue
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=7)
+        b = ws.cell(row=r, column=1, value=banner)
+        b.font = Font(name="Calibri", size=12, bold=True, color="FFFFFF")
+        b.fill = banner_fill
+        b.alignment = Alignment(horizontal="center", vertical="center")
+        r += 2
+        for l in part_links:
+            students = sorted(l["students"], key=lambda s: (s[2], s[1]))
+            head = (f"{l['section']}  |  {l['subject']}  |  {l['faculty'] or '—'}  |  "
+                    f"{l['band']}  —  {len(students)} student(s)")
+            ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=6)
+            h = ws.cell(row=r, column=1, value=head)
+            h.font = Font(name="Calibri", size=11, bold=True)
+            h.fill = block_fill
+            h.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+            for c in range(1, 8):
+                ws.cell(row=r, column=c).border = BORDER
+            target_row = r
+
+            back = ws.cell(row=r, column=7, value="◄ Back to abstract")
+            back.font, back.border, back.fill = link_font, BORDER, block_fill
+            back.alignment = Alignment(horizontal="center", vertical="center")
+            back.hyperlink = Hyperlink(ref="", location=f"'{l['ws'].title.replace(chr(39), chr(39)*2)}'!"
+                                                          f"{get_column_letter(l['col'])}{l['row']}", display="Back to abstract")
+            r += 1
+            for c, label in enumerate(["Sl", "Reg No", "Student Name", "Section", "Attendance %", "Faculty / Batch"], 1):
+                _abstract_apply(ws.cell(row=r, column=c, value=label), head_style)
+            r += 1
+            for n, (roll, name, pct, sec, fac) in enumerate(students, 1):
+                _abstract_apply(ws.cell(row=r, column=1, value=n), cell_style)
+                _abstract_apply(ws.cell(row=r, column=2, value=roll), cell_style)
+                _abstract_apply(ws.cell(row=r, column=3, value=name), name_style)
+                _abstract_apply(ws.cell(row=r, column=4, value=sec), cell_style)
+                pc = ws.cell(row=r, column=5, value=pct)
+                _abstract_apply(pc, cell_style)
+                pc.number_format = "0.00"
+                _abstract_apply(ws.cell(row=r, column=6, value=fac), name_style)
+                r += 1
+            r += 1
+
+            # hyperlink the abstract cell to this block
+            tgt = l["ws"].cell(row=l["row"], column=l["col"])
+            tgt.hyperlink = Hyperlink(ref="", location=f"'{dname}'!A{target_row}", display=str(tgt.value))
+            tgt.font = Font(name="Calibri", size=11, bold=False, color=LINK_COLOR, underline="single")
+        r += 1
 
 
 def build_abstract(input_path, batch_list_path, output_path, date_str=None, program="BCA"):
@@ -1539,15 +1626,18 @@ def build_abstract(input_path, batch_list_path, output_path, date_str=None, prog
     for sem in sems_present:
         sections = sorted(s for s, sv in section_sem.items() if sv == sem)
 
-        sheet_name = f"SUB {sem_label(sem)} SEM"[:31]
-        ws = wb.create_sheet(sheet_name)
+        links = []
+        ws = wb.create_sheet(f"SUB {sem_label(sem)} SEM"[:31])
         write_abstract_sheet(ws, sections, G, C, batch_map, date_str=date_str, program=program,
-                              sem_heading=sem_label(sem), batch_groups=batch_groups)
+                              sem_heading=sem_label(sem), batch_groups=batch_groups, links=links)
 
         ws_all = wb.create_sheet(f"SUB {sem_label(sem)} SEM CONSOLIDATED"[:31])
         write_abstract_consolidated_sheet(ws_all, sections, G, C, batch_map, date_str=date_str,
                                           program=program, sem_heading=sem_label(sem),
-                                          batch_groups=batch_groups)
+                                          batch_groups=batch_groups, links=links)
+
+        ws_det = wb.create_sheet(f"{sem_label(sem)} SEM SHORTAGE LIST"[:31])
+        write_shortage_detail_sheet(ws_det, links, sem_label(sem), date_str, program)
 
     if not wb.sheetnames:
         raise ValueError("No abstract sheets generated.")
