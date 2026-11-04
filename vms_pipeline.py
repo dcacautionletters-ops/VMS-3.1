@@ -1262,6 +1262,7 @@ ABSTRACT_LAST_COL = ABSTRACT_TOTAL_COL
 ABSTRACT_COL_SHORT_W = 12
 SHORT_BANDS = N_BUCKETS - 1          # the first 4 bands are shortage (<= 74.00); the last is 74.01-100
 SHORTAGE_LABEL = "SHORTAGE (0.00-74.00)"
+DETAIL_MIN_BLOCK_ROWS = 32   # rows each student list occupies, so the next list stays off-screen after a click
 LINK_COLOR = "0563C1"
 
 
@@ -1471,15 +1472,14 @@ def write_shortage_detail_sheet(ws, links, sem_heading, date_str, program="BCA")
     cell (title row + column headings + one row per student). The abstract
     cell is hyperlinked to its block; each block has a link back."""
     ws.sheet_view.showGridLines = False
-    ws.sheet_properties.outlinePr.summaryBelow = False   # the "+" sits on the title row, above its list
     for col, w in zip("ABCDEFG", (7, 16, 34, 20, 14, 36, 20)):
         ws.column_dimensions[col].width = w
     title = f"{sem_heading} SEM {program} SHORTAGE STUDENT LISTS AS OF {date_str}"
     ws.merge_cells("A1:G1")
     _abstract_apply(ws.cell(row=1, column=1, value=title), _abstract_style(bold=True))
     ws.row_dimensions[1].height = ABSTRACT_ROW2_H
-    note = ws.cell(row=2, column=1, value="Click a shortage number on the abstract sheets to jump to its list here, then click the [+] "
-                   "beside that list's title row to show only those names. 'Back to abstract' returns you.")
+    note = ws.cell(row=2, column=1, value="Click a shortage number on the abstract sheets to jump to its student list here; "
+                   "use 'Back to abstract' to return.")
     note.font = Font(name="Calibri", size=10, italic=True)
     ws.merge_cells("A2:G2")
 
@@ -1534,9 +1534,9 @@ def write_shortage_detail_sheet(ws, links, sem_heading, date_str, program="BCA")
                 pc.number_format = "0.00"
                 _abstract_apply(ws.cell(row=r, column=6, value=fac), name_style)
                 r += 1
-            # collapse this list (column headings + students) under its title row
-            ws.row_dimensions.group(target_row + 1, r - 1, outline_level=1, hidden=True)
-            r += 1
+            # pad every list to a full screen so that, after clicking a number (Excel scrolls the
+            # list's title row to the top), only THIS list's names are in view
+            r = max(r + 1, target_row + DETAIL_MIN_BLOCK_ROWS)
 
             # hyperlink the abstract cell to this block
             tgt = l["ws"].cell(row=l["row"], column=l["col"])
