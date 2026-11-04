@@ -1471,14 +1471,15 @@ def write_shortage_detail_sheet(ws, links, sem_heading, date_str, program="BCA")
     cell (title row + column headings + one row per student). The abstract
     cell is hyperlinked to its block; each block has a link back."""
     ws.sheet_view.showGridLines = False
+    ws.sheet_properties.outlinePr.summaryBelow = False   # the "+" sits on the title row, above its list
     for col, w in zip("ABCDEFG", (7, 16, 34, 20, 14, 36, 20)):
         ws.column_dimensions[col].width = w
     title = f"{sem_heading} SEM {program} SHORTAGE STUDENT LISTS AS OF {date_str}"
     ws.merge_cells("A1:G1")
     _abstract_apply(ws.cell(row=1, column=1, value=title), _abstract_style(bold=True))
     ws.row_dimensions[1].height = ABSTRACT_ROW2_H
-    note = ws.cell(row=2, column=1, value="Click any shortage number on the abstract sheets to jump to its student list here; "
-                   "use 'Back to abstract' to return.")
+    note = ws.cell(row=2, column=1, value="Click a shortage number on the abstract sheets to jump to its list here, then click the [+] "
+                   "beside that list's title row to show only those names. 'Back to abstract' returns you.")
     note.font = Font(name="Calibri", size=10, italic=True)
     ws.merge_cells("A2:G2")
 
@@ -1533,6 +1534,8 @@ def write_shortage_detail_sheet(ws, links, sem_heading, date_str, program="BCA")
                 pc.number_format = "0.00"
                 _abstract_apply(ws.cell(row=r, column=6, value=fac), name_style)
                 r += 1
+            # collapse this list (column headings + students) under its title row
+            ws.row_dimensions.group(target_row + 1, r - 1, outline_level=1, hidden=True)
             r += 1
 
             # hyperlink the abstract cell to this block
