@@ -272,6 +272,42 @@ def canon_section(s):
     return re.sub(r"[\s\-]+", " ", str(s).strip()).strip().upper()
 
 
+# Order in which specializations follow the plain (no-stream) sections of
+# the same year: BCA 2025 A, B, C ... then BCA AIML 2025 A ... then BCA DS 2025 A ...
+SPECIALIZATION_ORDER = {"": 0, "AIML": 1, "DS": 2}
+
+
+def section_sort_key(section):
+    """Sort key that puts sections in the order a human expects:
+    program, admission year, then plain sections before AIML before DS
+    (any other stream after those, alphabetically), then section letter.
+    'BCA 2025 A' < 'BCA 2025 B' < 'BCA AIML 2025 - A' < 'BCA DS 2025 - A'.
+    Dash / spacing differences ('2025 - A' vs '2025 A') do not matter."""
+    toks = canon_section(section).split()
+    if not toks:
+        return ("", 0, 0, "", "")
+    program = toks[0]
+    rest = toks[1:]
+    letter = ""
+    if rest and len(rest[-1]) == 1 and rest[-1].isalpha():
+        letter = rest.pop()
+    year = 0
+    for t in rest:
+        if re.fullmatch(r"\d{4}", t):
+            year = int(t)
+            rest.remove(t)
+            break
+    spec = " ".join(rest)
+    return (program, year, SPECIALIZATION_ORDER.get(spec, 3), spec, letter)
+
+
+def roll_sort_key(roll):
+    """Natural / numeric roll-number key: '26BC2' sorts before '26BC10',
+    and digits compare as numbers, not text."""
+    parts = re.findall(r"\d+|\D+", str(roll if roll is not None else "").strip())
+    return tuple((0, int(p), "") if p.isdigit() else (1, 0, p.upper()) for p in parts)
+
+
 def canon_subject(s):
     """Normalize a subject name purely for MATCHING (case/whitespace)."""
     return re.sub(r"\s+", " ", str(s).strip()).upper()
@@ -344,7 +380,7 @@ def series_of(batch):
 
 def get_series(dept_rows, C):
     batches = {str(r[C["batch"]]) for r in dept_rows}
-    return sorted({series_of(b) for b in batches})
+    return sorted({series_of(b) for b in batches}, key=section_sort_key)
 
 
 def series_df(dept_rows, ser, C):
@@ -489,7 +525,9 @@ def process_grid(rows, subjects, low_t, high_t, show_all, C):
             v = None
         pivot[key][r[C["subject"]]] = v
 
-    prows = list(pivot.values())
+    # Section by section (BCA 2025 A, B, C, AIML A, DS A ...), then by roll number
+    prows = sorted(pivot.values(),
+                   key=lambda row: (section_sort_key(row[C["batch"]]), roll_sort_key(row[C["roll"]])))
 
     # Final Avg = mean of the student's attendance across EVERY subject
     # (theory + lab) in the report — computed here, BEFORE the below-limit
@@ -991,7 +1029,7 @@ def build_report(input_path, output_path, low=0.0, high=75.0, dept="ALL", exclud
             if a_grid:
                 write_sheet(wb, f"{ser} GEN ALL", a_grid, s_rows, s_subs, high, C)
 
-            sections = sorted({str(r[C["batch"]]) for r in s_rows})
+            sections = sorted({str(r[C["batch"]]) for r in s_rows}, key=section_sort_key)
             for sec in sections:
                 sec_rows = [r for r in s_rows if str(r[C["batch"]]) == sec]
                 grid, _ = process_grid(sec_rows, s_subs, low, high, False, C)
@@ -1472,6 +1510,7 @@ def write_shortage_detail_sheet(ws, links, sem_heading, date_str, program="BCA")
     cell (title row + column headings + one row per student). The abstract
     cell is hyperlinked to its block; each block has a link back."""
     ws.sheet_view.showGridLines = False
+    ws.sheet_properties.outlinePr.summaryBelow = False   # [+]/[-] sits on the list's title row
     for col, w in zip("ABCDEFG", (7, 16, 34, 20, 14, 36, 20)):
         ws.column_dimensions[col].width = w
     title = f"{sem_heading} SEM {program} SHORTAGE STUDENT LISTS AS OF {date_str}"
@@ -1537,6 +1576,9 @@ def write_shortage_detail_sheet(ws, links, sem_heading, date_str, program="BCA")
             # pad every list to a full screen so that, after clicking a number (Excel scrolls the
             # list's title row to the top), only THIS list's names are in view
             r = max(r + 1, target_row + DETAIL_MIN_BLOCK_ROWS)
+            # Group (but leave OPEN) everything under the title row. Without the macro nothing
+            # changes; with ExpandOnClick installed, a click collapses all lists and re-opens only this one.
+            ws.row_dimensions.group(target_row + 1, r - 1, outline_level=1, hidden=False)
 
             # hyperlink the abstract cell to this block
             tgt = l["ws"].cell(row=l["row"], column=l["col"])
@@ -1627,7 +1669,7 @@ def build_abstract(input_path, batch_list_path, output_path, date_str=None, prog
     wb = Workbook()
     wb.remove(wb.active)
     for sem in sems_present:
-        sections = sorted(s for s, sv in section_sem.items() if sv == sem)
+        sections = sorted((s for s, sv in section_sem.items() if sv == sem), key=section_sort_key)
 
         links = []
         ws = wb.create_sheet(f"SUB {sem_label(sem)} SEM"[:31])
@@ -1743,11 +1785,11 @@ def build_debar_list(input_path, output_path, date_str=None, notice_board=False,
     notice_board=True builds a print-friendly variant meant for posting on
     a physical notice board instead of internal/faculty use: the trailing
     Student Signature column, the SUBJECT / FACULTY IN CHARGE / NO of
-    students / Plan of Action / Signature legend table, the per-subject
-    shortage-count footer row, and the Class Teacher / HOD / Principal
-    signature line are all left out entirely (none of that is useful to a
-    student reading the board) — the sheet ends right after the student
-    data. Every font is scaled up by `font_scale` and every row height by
+    students / Plan of Action / Signature legend table, and the Class
+    Teacher / HOD / Principal signature line are left out (none of that is
+    useful to a student reading the board). The per-subject shortage-count
+    footer row ("No of students having shortage") IS kept, so the sheet
+    ends with those totals right after the student data. Every font is scaled up by `font_scale` and every row height by
     `row_scale` for legibility from a distance; the Sl No / Roll No /
     Student Name columns are widened by the same factor so they don't
     look cramped at the bigger font size, and the college logo is
@@ -1970,20 +2012,22 @@ def build_debar_list(input_path, output_path, date_str=None, notice_board=False,
 
             last_data_row = row_out - 1
 
+            # Footer: shortage count per subject — on BOTH copies (the notice
+            # board gets it too, scaled like the rest of its rows)
+            footer_row = last_data_row + 1
+            ows.row_dimensions[footer_row].height = DEBAR_FOOTER_H * (row_scale if notice_board else 1.0)
+            for c in range(1, n_cols + 1):
+                cell = ows.cell(row=footer_row, column=c)
+                if c == 3:
+                    cell.value = "No of students having shortage"
+                    _dapply(cell, "footerLabel", styles)
+                elif first_subj <= c <= first_subj + n_subjects - 1:
+                    cell.value = counts[c - first_subj]
+                    _dapply(cell, "footerLabel", styles)
+                else:
+                    _dapply(cell, "footerCount", styles)
+
             if not notice_board:
-                # Footer: counts per subject
-                footer_row = last_data_row + 1
-                ows.row_dimensions[footer_row].height = DEBAR_FOOTER_H
-                for c in range(1, n_cols + 1):
-                    cell = ows.cell(row=footer_row, column=c)
-                    if c == 3:
-                        cell.value = "No of students having shortage"
-                        _dapply(cell, "footerLabel")
-                    elif first_subj <= c <= first_subj + n_subjects - 1:
-                        cell.value = counts[c - first_subj]
-                        _dapply(cell, "footerLabel")
-                    else:
-                        _dapply(cell, "footerCount")
 
                 # Legend: SUBJECT / FACULTY IN CHARGE / NO of students /
                 # Plan of Action / Signature — one row per subject column above.
