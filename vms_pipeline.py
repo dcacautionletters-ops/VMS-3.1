@@ -276,16 +276,21 @@ def canon_section(s):
 # the same year: BCA 2025 A, B, C ... then BCA AIML 2025 A ... then BCA DS 2025 A ...
 SPECIALIZATION_ORDER = {"": 0, "AIML": 1, "DS": 2}
 
+# Program / department prefix of the batch name (first word): CG series first,
+# then CAI, then CDS last (BCA = plain general series, same rank as CG).
+# Anything else follows, alphabetically.
+PROGRAM_ORDER = {"CG": 0, "BCA": 0, "CAI": 1, "CDS": 2}
+
 
 def section_sort_key(section):
     """Sort key that puts sections in the order a human expects:
-    program, admission year, then plain sections before AIML before DS
+    program (CG, then CAI, then CDS), admission year, then plain sections before AIML before DS
     (any other stream after those, alphabetically), then section letter.
     'BCA 2025 A' < 'BCA 2025 B' < 'BCA AIML 2025 - A' < 'BCA DS 2025 - A'.
     Dash / spacing differences ('2025 - A' vs '2025 A') do not matter."""
     toks = canon_section(section).split()
     if not toks:
-        return ("", 0, 0, "", "")
+        return (0, "", 0, 0, "", "")
     program = toks[0]
     rest = toks[1:]
     letter = ""
@@ -298,7 +303,8 @@ def section_sort_key(section):
             rest.remove(t)
             break
     spec = " ".join(rest)
-    return (program, year, SPECIALIZATION_ORDER.get(spec, 3), spec, letter)
+    return (PROGRAM_ORDER.get(program, 3), program, year,
+            SPECIALIZATION_ORDER.get(spec, 3), spec, letter)
 
 
 def roll_sort_key(roll):
@@ -997,7 +1003,7 @@ def build_report(input_path, output_path, low=0.0, high=75.0, dept="ALL", exclud
     if not df:
         raise ValueError("No data left after filtering — check the input file / include / exclude list.")
 
-    all_depts = sorted({r["_dept"] for r in df})
+    all_depts = sorted({r["_dept"] for r in df}, key=section_sort_key)   # CG, CAI, CDS
     if dept and dept.strip().upper() not in ("ALL", ""):
         wanted = dept.strip().upper()
         depts = [d for d in all_depts if d == wanted]
