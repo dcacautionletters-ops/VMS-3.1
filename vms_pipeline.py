@@ -416,9 +416,46 @@ def parse_course_community_name(name):
     name = COURSE_CODE_RE.sub("", name, count=1).strip()
     m = BATCH_SUFFIX_RE.search(name)
     if m:
-        subject = BATCH_SUFFIX_RE.sub("", name).strip()
+        # 'Algorithmic ... C Lab - BATCH 1' (MCA list) leaves a dangling ' -' once the
+        # batch suffix is cut, so trailing dashes/spaces are stripped as well
+        subject = BATCH_SUFFIX_RE.sub("", name).strip().rstrip("-–— ").strip()
         return subject, f"Batch {m.group(2)}"
-    return name, None
+    return name.rstrip("-–— ").strip(), None
+
+
+BATCH_LIST_DIAG = []   # filled by load_batch_list(): what was found in each sheet (used in error messages)
+
+_BL_ALIASES = {
+    "roll":    {"regno", "registerno", "registernumber", "registrationno", "registrationnumber",
+                "rollno", "rollnumber", "usn", "enrollmentno"},
+    "section": {"batch", "section", "class", "classname"},
+    "course":  {"coursecommunityname", "coursecommunity", "communityname", "coursename", "course", "community"},
+    "faculty": {"faculty", "facultyname", "staff", "staffname", "facultyincharge", "facultyincharge"},
+}
+
+
+def _norm_header(h):
+    """'Reg No.' / 'REG NO' / ' reg. no ' -> 'regno' (letters only, lowercase)."""
+    return re.sub(r"[^a-z]", "", str(h or "").lower())
+
+
+def _find_batch_list_header(ws, max_scan=15):
+    """Find the header row of a Batch List sheet. Returns (row_number, {field: col_index})
+    for the first row (within the first `max_scan`) that has all four columns, tolerating
+    title rows above the table and small spelling differences ('Reg No' / 'Register No' ...).
+    Returns (None, {}) when no row has all four."""
+    for r_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=max_scan, values_only=True), start=1):
+        found = {}
+        for ci, v in enumerate(row):
+            n = _norm_header(v)
+            if not n:
+                continue
+            for field, names in _BL_ALIASES.items():
+                if field not in found and n in names:
+                    found[field] = ci
+        if len(found) == 4:
+            return r_idx, found
+    return None, {}
 
 
 def load_batch_list(path):
@@ -426,34 +463,41 @@ def load_batch_list(path):
     list of (section, subject, roll, batch_label, faculty) tuples — one
     per student per lab/internship. `section` is sanitized the same way
     write_sheet() sanitizes section names, so it lines up with the debar
-    sheet titles and the consolidated report's own Batch column."""
+    sheet titles and the consolidated report's own Batch column.
+
+    The header row may sit below title rows and the column names may be
+    spelled a little differently (see _BL_ALIASES). What was found in each
+    sheet is recorded in BATCH_LIST_DIAG so an error can say exactly what
+    was wrong instead of a generic message."""
     wb = load_workbook(path, data_only=True)
     entries = []
+    BATCH_LIST_DIAG.clear()
     for sn in wb.sheetnames:
         ws = wb[sn]
-        headers = [c.value for c in ws[1]]
-
-        def idx(name):
-            return headers.index(name) if name in headers else -1
-
-        i_roll = idx("Reg No.")
-        i_section = idx("Batch")
-        i_course = idx("Course Community Name")
-        i_fac = idx("Faculty")
-        if -1 in (i_roll, i_section, i_course, i_fac):
+        h_row, cols = _find_batch_list_header(ws)
+        if h_row is None:
+            first = next((row for row in ws.iter_rows(min_row=1, max_row=15, values_only=True)
+                          if any(v not in (None, "") for v in row)), ())
+            BATCH_LIST_DIAG.append(f"sheet '{sn}': no row with all of Reg No / Batch / Course Community Name / Faculty "
+                                   f"(first row seen: {[v for v in first if v not in (None, '')][:10]})")
             continue
+        i_roll, i_section, i_course, i_fac = cols["roll"], cols["section"], cols["course"], cols["faculty"]
 
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            if not row or row[i_roll] is None:
+        kept = skipped = 0
+        for row in ws.iter_rows(min_row=h_row + 1, values_only=True):
+            if not row or len(row) <= max(cols.values()) or row[i_roll] is None:
                 continue
             roll = str(row[i_roll]).strip()
             section = str(row[i_section]).strip().replace("/", "-") if row[i_section] else ""
             course_raw = row[i_course]
             fac = str(row[i_fac]).strip() if row[i_fac] else ""
             if not (roll and section and course_raw and fac):
+                skipped += 1
                 continue
             subject, batch_label = parse_course_community_name(course_raw)
             entries.append((section, subject, roll, batch_label, fac))
+            kept += 1
+        BATCH_LIST_DIAG.append(f"sheet '{sn}': {kept} usable row(s), {skipped} skipped for a blank Reg No / Batch / Course / Faculty cell")
     return entries
 
 
@@ -1613,15 +1657,19 @@ def build_abstract(input_path, batch_list_path, output_path, date_str=None, prog
     # Soft Skill is never part of the abstract.
     G, C = load_raw(input_path, [SOFT_SKILL_KEYWORD])
     batch_entries = load_batch_list(batch_list_path)
-    if not batch_entries:
-        raise ValueError("No usable rows found in the Batch List workbook — check its column headers match "
-                          "'Reg No.', 'Batch', 'Course Community Name', 'Faculty'.")
+    no_batch_list = not batch_entries
+    if no_batch_list:
+        print("  [check] No usable rows in the Batch List — building the abstract from the report's own "
+              "faculty names (labs/internship will not be split into batches).")
+        for d in BATCH_LIST_DIAG:
+            print(f"          {d}")
 
     # canon_section() so a Batch List section spelled without the dash
     # ('BCA AIML 2026 A') still matches the report's own spelling
     # ('BCA AIML 2026 - A') — see canon_section()'s docstring. batch_map
     # is looked up the same way inside _abstract_section_rows().
-    batch_entries = apply_manual_overrides(align_batch_entries(batch_entries, G, C), G, C)
+    if batch_entries:
+        batch_entries = apply_manual_overrides(align_batch_entries(batch_entries, G, C), G, C)
 
     batch_map = {}
     batch_groups = {}  # (canon section, subject) -> {(batch_label, faculty)} — every batch the list defines
@@ -1635,6 +1683,12 @@ def build_abstract(input_path, batch_list_path, output_path, date_str=None, prog
 
     # Data-quality checks so nothing goes missing silently.
     ABSTRACT_WARNINGS.clear()
+    if no_batch_list:
+        # nothing to cross-reference: cover every section in the report, faculty from the report itself
+        covered_sections = {canon_section(str(r.get(C["batch"]) or "").strip().replace("/", "-")) for r in G
+                            if str(r.get(C["batch"]) or "").strip()}
+        ABSTRACT_WARNINGS.append("The Batch List had no usable rows, so faculty names come from the consolidated report "
+                                 "and labs are not split by batch. " + " | ".join(BATCH_LIST_DIAG))
     report_keys, unmatched = set(), {}
     for r in G:
         sec = canon_section(str(r.get(C["batch"]) or "").strip().replace("/", "-"))
